@@ -1,0 +1,44 @@
+# Binaries
+bin/
+lokilens
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+.gocache/
+.gotmp/
+
+# E2E results (generated)
+e2e/results.json
+
+# Docker volumes
+loki-data/
+
+# Tools
+.gstack/
+.claude/
+
+# Terraform
+.terraform/
+
+# Cloudflare
+.wrangler/
+
+# QA screenshots
+.screenshots/

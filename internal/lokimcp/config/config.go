@@ -1,0 +1,88 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	LokiBaseURL    string
+	LokiAPIKey     string
+	LokiTimeout    time.Duration
+	LokiMaxRetries int
+	MaxTimeRange   time.Duration
+	MaxResults     int
+	LogLevel       string
+}
+
+// LoadMCP loads config for the Loki-only MCP server.
+func LoadMCP() (*Config, error) {
+	loadDotEnv()
+
+	cfg := &Config{
+		LokiBaseURL:    os.Getenv("LOKI_BASE_URL"),
+		LokiAPIKey:     os.Getenv("LOKI_API_KEY"),
+		LokiTimeout:    envDuration("LOKI_TIMEOUT", 30*time.Second),
+		LokiMaxRetries: envInt("LOKI_MAX_RETRIES", 2),
+		MaxTimeRange:   envDuration("MAX_TIME_RANGE", 24*time.Hour),
+		MaxResults:     envInt("MAX_RESULTS", 500),
+		LogLevel:       envOrDefault("LOG_LEVEL", "info"),
+	}
+
+	if cfg.LokiBaseURL == "" {
+		return nil, fmt.Errorf("missing required environment variables: LOKI_BASE_URL")
+	}
+
+	return cfg, nil
+}
+
+func loadDotEnv() {
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		val = strings.Trim(val, `"'`)
+		if os.Getenv(key) == "" {
+			os.Setenv(key, val)
+		}
+	}
+}
+
+func envOrDefault(key, defaultVal string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultVal
+}
+
+func envDuration(key string, defaultVal time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return defaultVal
+}
+
+func envInt(key string, defaultVal int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return defaultVal
+}
