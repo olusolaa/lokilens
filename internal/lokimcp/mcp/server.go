@@ -12,9 +12,9 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/lokilens/lokilens/internal/lokimcp/audit"
-	"github.com/lokilens/lokilens/internal/lokimcp/loki"
-	"github.com/lokilens/lokilens/internal/lokimcp/safety"
+	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
+	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
 )
 
 // NewServer creates an MCP server with Loki tools only.

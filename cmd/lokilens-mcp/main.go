@@ -28,11 +28,11 @@ import (
 
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/lokilens/lokilens/internal/lokimcp/audit"
-	"github.com/lokilens/lokilens/internal/lokimcp/config"
-	"github.com/lokilens/lokilens/internal/lokimcp/loki"
-	mcppkg "github.com/lokilens/lokilens/internal/lokimcp/mcp"
-	"github.com/lokilens/lokilens/internal/lokimcp/safety"
+	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/config"
+	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
+	mcppkg "github.com/olusolaa/lokilens/internal/lokimcp/mcp"
+	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
 )
 
 func main() {

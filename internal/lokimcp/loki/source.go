@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/lokilens/lokilens/internal/lokimcp/audit"
-	"github.com/lokilens/lokilens/internal/lokimcp/safety"
+	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
 )
 
 type Source struct {

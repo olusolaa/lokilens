@@ -1,4 +1,4 @@
-module github.com/lokilens/lokilens
+module github.com/olusolaa/lokilens
 
 go 1.25.0
 
