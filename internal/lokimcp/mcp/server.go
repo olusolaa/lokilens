@@ -95,23 +95,22 @@ func (h *mcpHandlers) wrap(fn handlerFunc) server.ToolHandlerFunc {
 			h.audit.ToolInvoked(toolName, durationMS)
 		}
 
-		data, err := json.Marshal(result)
+		text, err := h.marshalAndRedact(toolName, result)
 		if err != nil {
-			return nil, fmt.Errorf("marshaling result: %w", err)
+			return nil, err
 		}
 
-		text := string(data)
-		if h.pii != nil {
-			redacted, count := h.pii.RedactWithCount(text)
-			if count > 0 {
-				h.logger.Info("pii redacted from MCP result", "tool", toolName, "patterns", count)
-				if h.audit != nil {
-					h.audit.PIIRedacted("mcp", toolName, count)
+		// Over budget: first try a typed shrink (drops raw evidence, keeps the
+		// analysis, stays valid JSON); byte-truncate only as a last resort.
+		if len(text) > maxResultBytes {
+			if shrunk, ok := loki.ShrinkOversized(result); ok {
+				shrunkText, serr := h.marshalAndRedact(toolName, shrunk)
+				if serr == nil {
+					h.logger.Warn("tool result shrunk to fit size budget", "tool", toolName, "bytes", len(text), "shrunk_bytes", len(shrunkText))
+					text = shrunkText
 				}
 			}
-			text = redacted
 		}
-
 		if len(text) > maxResultBytes {
 			h.logger.Warn("tool result truncated", "tool", toolName, "bytes", len(text))
 			text = truncateUTF8(text, maxResultBytes) +
@@ -213,6 +212,26 @@ func registerLokiTools(s *server.MCPServer, src *loki.Source, h *mcpHandlers) {
 	)
 
 	h.logger.Info("registered Loki MCP tools", "count", 4)
+}
+
+// marshalAndRedact serializes a tool result and applies PII redaction.
+func (h *mcpHandlers) marshalAndRedact(toolName string, result any) (string, error) {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return "", fmt.Errorf("marshaling result: %w", err)
+	}
+	text := string(data)
+	if h.pii != nil {
+		redacted, count := h.pii.RedactWithCount(text)
+		if count > 0 {
+			h.logger.Info("pii redacted from MCP result", "tool", toolName, "patterns", count)
+			if h.audit != nil {
+				h.audit.PIIRedacted("mcp", toolName, count)
+			}
+		}
+		text = redacted
+	}
+	return text, nil
 }
 
 // truncateUTF8 cuts s to at most maxBytes without splitting a UTF-8 rune.

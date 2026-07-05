@@ -40,11 +40,15 @@ type GetLabelValuesInput struct {
 }
 
 type GetLabelValuesOutput struct {
-	LabelName   string   `json:"label_name"`
-	Values      []string `json:"values"`
-	TotalValues int      `json:"total_values"`
-	Truncated   bool     `json:"truncated,omitempty"`
-	Warning     string   `json:"warning,omitempty"`
+	LabelName string `json:"label_name"`
+	// TotalValues counts the values matching 'contains' (all values when no
+	// filter was given); TotalLabelValues counts the label's values before
+	// filtering, so a zero-match filter is distinguishable from an empty label.
+	TotalValues      int      `json:"total_values"`
+	TotalLabelValues int      `json:"total_label_values,omitempty"`
+	Truncated        bool     `json:"truncated,omitempty"`
+	Warning          string   `json:"warning,omitempty"`
+	Values           []string `json:"values"`
 }
 
 type QueryStatsInput struct {
@@ -163,7 +167,7 @@ func (h *ToolHandlers) QueryLogs(ctx context.Context, input QueryLogsInput) (Que
 	if len(out.Logs) == 0 {
 		var hints string
 		if strings.TrimSpace(input.StartTime) == "" {
-			hints = "Searched up to 90 days back with auto-widening and found nothing. " +
+			hints = "Searched up to 30 days back with auto-widening (Loki's max range) and found nothing. " +
 				"Possible causes: (1) label names/values are wrong — call get_labels and get_label_values to verify, " +
 				"(2) the filter is too specific — try removing line filters, " +
 				"(3) the service may not be logging."
@@ -262,9 +266,16 @@ func (h *ToolHandlers) GetLabelValues(ctx context.Context, input GetLabelValuesI
 		TotalValues: total,
 		Truncated:   truncated,
 	}
+	if input.Contains != "" {
+		out.TotalLabelValues = len(resp.Data)
+		if total == 0 && len(resp.Data) > 0 {
+			out.Warning = fmt.Sprintf("no values contain %q, but the label has %d values — check the spelling or drop 'contains'",
+				input.Contains, len(resp.Data))
+		}
+	}
 	if truncated {
-		out.Warning = fmt.Sprintf("showing %d of %d values — pass 'contains' to narrow the search, or raise 'limit' (max %d)",
-			len(values), total, maxLabelValuesLimit)
+		out.Warning = joinWarning(out.Warning, fmt.Sprintf("showing %d of %d values — pass 'contains' to narrow the search, or raise 'limit' (max %d)",
+			len(values), total, maxLabelValuesLimit))
 	}
 
 	h.audit.ToolInvoked("get_label_values", time.Since(start).Milliseconds(),
@@ -366,7 +377,7 @@ func (h *ToolHandlers) QueryStats(ctx context.Context, input QueryStatsInput) (Q
 	if len(out.Series) == 0 {
 		var hints string
 		if strings.TrimSpace(input.StartTime) == "" {
-			hints = "Searched up to 90 days back with auto-widening and found nothing. " +
+			hints = "Searched up to 30 days back with auto-widening (Loki's max range) and found nothing. " +
 				"Possible causes: (1) label names/values are wrong — call get_labels and get_label_values to verify, " +
 				"(2) the query may be wrong — simplify it, " +
 				"(3) the service may not be logging."

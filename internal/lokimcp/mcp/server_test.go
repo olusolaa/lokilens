@@ -315,3 +315,42 @@ func TestNewServer_GetLabelValuesSchemaHasCapParams(t *testing.T) {
 	assertHasProperty(t, glv, "contains")
 	assertHasProperty(t, glv, "limit")
 }
+
+func TestMcpHandler_ShrinksKnownTypeToValidJSON(t *testing.T) {
+	logger := slog.Default()
+	h := &mcpHandlers{pii: safety.NewPIIFilter(), audit: audit.New(logger), logger: logger}
+
+	// A QueryLogsOutput whose raw logs blow the 30KB budget: the wrapper must
+	// shrink it (drop logs, keep analysis) rather than byte-truncate it.
+	big := loki.QueryLogsOutput{
+		TopPatterns: []loki.ErrorPattern{{Pattern: "connection timeout to <*>", Count: 3000, Pct: 100, Sample: "connection timeout to 10.0.0.1"}},
+	}
+	for i := 0; i < 3000; i++ {
+		big.Logs = append(big.Logs, loki.LogEntry{
+			Timestamp: "2026-07-05T10:00:00.000Z",
+			Line:      "connection timeout to 10.0.0.1 after 30s while calling downstream",
+			Labels:    map[string]string{"service": "payments"},
+		})
+	}
+	handler := h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+		return big, nil
+	})
+
+	result, err := handler(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	if len(text) > 30_000+300 {
+		t.Errorf("expected shrunk result under budget, got %d bytes", len(text))
+	}
+	if !json.Valid([]byte(text)) {
+		t.Error("shrunk result must remain valid JSON")
+	}
+	if stringContains(text, "TRUNCATED") {
+		t.Error("known types should shrink, never byte-truncate")
+	}
+	if !stringContains(text, "top_patterns") {
+		t.Error("analysis must survive the shrink")
+	}
+}

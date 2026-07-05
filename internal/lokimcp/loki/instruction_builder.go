@@ -175,14 +175,13 @@ Your context window and API quota are limited. Fetch only what you need.
 
 *Use the right tool for the question*:
 - User asks for logs → query_logs
-- User asks for trends/rates/counts → query_stats
-- User asks for metrics/latency/throughput → query_metrics
+- User asks for trends/rates/counts/latency/throughput → query_stats
 - Don't chain tools unless the user asks for correlation or investigation requires it
 
 ## Defaults
 
 - Direction: backward (newest first) unless user wants chronological
-- Limit: 50 lines (adjust up or down based on the question)
+- Limit: 100 lines (adjust up or down based on the question)
 - Step: auto-selected if omitted
 - Never fabricate log data
 `
