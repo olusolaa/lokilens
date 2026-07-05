@@ -33,13 +33,18 @@ type GetLabelsOutput struct {
 
 type GetLabelValuesInput struct {
 	LabelName string `json:"label_name" jsonschema_description:"The label to get values for (e.g. service or level)"`
+	Contains  string `json:"contains,omitempty" jsonschema_description:"Case-insensitive substring filter applied before the limit (e.g. 'pay' to find payment services)"`
 	StartTime string `json:"start_time,omitempty" jsonschema_description:"Start time. Defaults to 6h ago"`
 	EndTime   string `json:"end_time,omitempty" jsonschema_description:"End time. Defaults to now"`
+	Limit     int    `json:"limit,omitempty" jsonschema_description:"Max values to return (1-200, default 50)"`
 }
 
 type GetLabelValuesOutput struct {
-	LabelName string   `json:"label_name"`
-	Values    []string `json:"values"`
+	LabelName   string   `json:"label_name"`
+	Values      []string `json:"values"`
+	TotalValues int      `json:"total_values"`
+	Truncated   bool     `json:"truncated,omitempty"`
+	Warning     string   `json:"warning,omitempty"`
 }
 
 type QueryStatsInput struct {
@@ -250,14 +255,24 @@ func (h *ToolHandlers) GetLabelValues(ctx context.Context, input GetLabelValuesI
 		return GetLabelValuesOutput{}, fmt.Errorf("loki label_values failed: %w", err)
 	}
 
+	values, total, truncated := capLabelValues(resp.Data, input.Contains, input.Limit)
+	out := GetLabelValuesOutput{
+		LabelName:   input.LabelName,
+		Values:      values,
+		TotalValues: total,
+		Truncated:   truncated,
+	}
+	if truncated {
+		out.Warning = fmt.Sprintf("showing %d of %d values — pass 'contains' to narrow the search, or raise 'limit' (max %d)",
+			len(values), total, maxLabelValuesLimit)
+	}
+
 	h.audit.ToolInvoked("get_label_values", time.Since(start).Milliseconds(),
 		slog.String("label", input.LabelName),
-		slog.Int("result_count", len(resp.Data)),
+		slog.Int("result_count", total),
+		slog.Int("returned_count", len(values)),
 	)
-	return GetLabelValuesOutput{
-		LabelName: input.LabelName,
-		Values:    resp.Data,
-	}, nil
+	return out, nil
 }
 
 func (h *ToolHandlers) QueryStats(ctx context.Context, input QueryStatsInput) (QueryStatsOutput, error) {

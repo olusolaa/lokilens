@@ -1430,3 +1430,130 @@ func absDuration(d time.Duration) time.Duration {
 	}
 	return d
 }
+
+// --- capLabelValues ---
+
+func TestCapLabelValues_UnderLimitUnchanged(t *testing.T) {
+	values := []string{"payments", "auth", "kyc"}
+	got, total, truncated := capLabelValues(values, "", 0)
+	if len(got) != 3 || total != 3 || truncated {
+		t.Errorf("expected all 3 values untruncated, got %d values, total=%d, truncated=%v", len(got), total, truncated)
+	}
+}
+
+func TestCapLabelValues_DefaultLimitApplied(t *testing.T) {
+	values := make([]string, 500)
+	for i := range values {
+		values[i] = fmt.Sprintf("pod-%d", i)
+	}
+	got, total, truncated := capLabelValues(values, "", 0)
+	if len(got) != defaultLabelValuesLimit {
+		t.Errorf("expected %d values with default limit, got %d", defaultLabelValuesLimit, len(got))
+	}
+	if total != 500 {
+		t.Errorf("expected total=500, got %d", total)
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+}
+
+func TestCapLabelValues_LimitClampedToMax(t *testing.T) {
+	values := make([]string, 500)
+	for i := range values {
+		values[i] = fmt.Sprintf("v-%d", i)
+	}
+	got, _, _ := capLabelValues(values, "", 10_000)
+	if len(got) != maxLabelValuesLimit {
+		t.Errorf("expected limit clamped to %d, got %d values", maxLabelValuesLimit, len(got))
+	}
+}
+
+func TestCapLabelValues_ContainsFilter(t *testing.T) {
+	values := []string{"payments-api", "PAYMENTS-worker", "auth-api", "kyc-service"}
+	got, total, truncated := capLabelValues(values, "payment", 0)
+	if len(got) != 2 || total != 2 {
+		t.Errorf("expected 2 case-insensitive matches, got %d (total=%d)", len(got), total)
+	}
+	if truncated {
+		t.Error("expected truncated=false for small filtered set")
+	}
+}
+
+func TestCapLabelValues_ContainsThenLimit(t *testing.T) {
+	values := make([]string, 100)
+	for i := range values {
+		values[i] = fmt.Sprintf("payments-%d", i)
+	}
+	got, total, truncated := capLabelValues(values, "payments", 10)
+	if len(got) != 10 {
+		t.Errorf("expected 10 values after limit, got %d", len(got))
+	}
+	if total != 100 {
+		t.Errorf("expected total=100 (post-filter, pre-cap), got %d", total)
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+}
+
+// --- AnalyzeStats series cap ---
+
+func TestAnalyzeStats_CapsSeriesCount(t *testing.T) {
+	out := &QueryStatsOutput{Step: "5m"}
+	for i := 0; i < 50; i++ {
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"pod": fmt.Sprintf("pod-%d", i)},
+			// series i has total = i, so pod-49 is the largest
+			Values: []DataPoint{{Timestamp: "2026-07-05T10:00:00Z", Value: fmt.Sprintf("%d", i)}},
+		})
+	}
+
+	AnalyzeStats(out)
+
+	if out.TotalSeries != 50 {
+		t.Errorf("expected TotalSeries=50, got %d", out.TotalSeries)
+	}
+	if len(out.Series) != maxSeriesReported {
+		t.Errorf("expected %d series reported, got %d", maxSeriesReported, len(out.Series))
+	}
+	if len(out.Summaries) != maxSeriesReported {
+		t.Errorf("expected %d summaries, got %d", maxSeriesReported, len(out.Summaries))
+	}
+	if out.OmittedSeries != 50-maxSeriesReported {
+		t.Errorf("expected OmittedSeries=%d, got %d", 50-maxSeriesReported, out.OmittedSeries)
+	}
+	if !strings.Contains(out.Warning, "aggregate over fewer labels") {
+		t.Errorf("expected cardinality hint in warning, got %q", out.Warning)
+	}
+	// Largest series kept first
+	if out.Series[0].Labels["pod"] != "pod-49" {
+		t.Errorf("expected largest series (pod-49) first, got %q", out.Series[0].Labels["pod"])
+	}
+	// Raw data points only for the top maxSampleSeries
+	if out.Series[0].Values == nil {
+		t.Error("expected raw values kept for top series")
+	}
+	if out.Series[maxSampleSeries].Values != nil {
+		t.Errorf("expected values nil beyond top %d series", maxSampleSeries)
+	}
+}
+
+func TestAnalyzeStats_NoCapWhenFewSeries(t *testing.T) {
+	out := &QueryStatsOutput{Step: "5m"}
+	for i := 0; i < 3; i++ {
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"service": fmt.Sprintf("svc-%d", i)},
+			Values: []DataPoint{{Timestamp: "2026-07-05T10:00:00Z", Value: "5"}},
+		})
+	}
+
+	AnalyzeStats(out)
+
+	if len(out.Series) != 3 || out.OmittedSeries != 0 {
+		t.Errorf("expected all 3 series kept with none omitted, got %d kept, %d omitted", len(out.Series), out.OmittedSeries)
+	}
+	if out.Warning != "" {
+		t.Errorf("expected no warning for small series count, got %q", out.Warning)
+	}
+}

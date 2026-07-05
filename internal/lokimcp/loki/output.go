@@ -63,14 +63,15 @@ type TrendSummary struct {
 }
 
 type QueryStatsOutput struct {
-	Series      []MetricSeries          `json:"series"`
-	TotalSeries int                     `json:"total_series"`
-	Step        string                  `json:"step,omitempty"`
-	Query       string                  `json:"query_executed"`
-	TimeRange   string                  `json:"time_range,omitempty"`
-	Warning     string                  `json:"warning,omitempty"`
-	ExecTimeMS  int                     `json:"exec_time_ms,omitempty"`
-	Summaries   map[string]TrendSummary `json:"summaries,omitempty"`
+	Series        []MetricSeries          `json:"series"`
+	TotalSeries   int                     `json:"total_series"`
+	OmittedSeries int                     `json:"omitted_series,omitempty"`
+	Step          string                  `json:"step,omitempty"`
+	Query         string                  `json:"query_executed"`
+	TimeRange     string                  `json:"time_range,omitempty"`
+	Warning       string                  `json:"warning,omitempty"`
+	ExecTimeMS    int                     `json:"exec_time_ms,omitempty"`
+	Summaries     map[string]TrendSummary `json:"summaries,omitempty"`
 }
 
 // maxLogLineLength caps individual log lines sent to the LLM.
@@ -131,37 +132,114 @@ func AnalyzeLogs(out *QueryLogsOutput, limit int) {
 }
 
 // maxSampleSeries is the number of series to keep raw data points for.
-// The model has summaries (trend, peak, avg) for ALL series — raw data points
-// are only needed for a few series to support detailed follow-ups.
+// The model has summaries (trend, peak, avg) for the reported series — raw
+// data points are only needed for a few series to support detailed follow-ups.
 const maxSampleSeries = 5
 
+// maxSeriesReported caps how many series (label sets + summaries) are returned.
+// A group-by on a high-cardinality label can produce hundreds of series; each
+// one costs label maps plus a summary in the model's context on every
+// subsequent turn. Past this cap the model should aggregate over fewer labels,
+// not read more series.
+const maxSeriesReported = 20
+
 // AnalyzeStats enriches a QueryStatsOutput with trend summaries and downsampling,
-// then compacts the series data. Summaries are kept for all series (they're small).
-// Raw data points are kept only for the top few series.
+// then compacts the series data. Series are ranked by total (largest first) so
+// the caps keep the most significant ones: summaries for the top maxSeriesReported,
+// raw data points only for the top maxSampleSeries of those.
 func AnalyzeStats(out *QueryStatsOutput) {
 	out.TotalSeries = len(out.Series)
+	if len(out.Series) == 0 {
+		return
+	}
 
-	if len(out.Series) > 0 {
-		stepMinutes := stepToMinutes(out.Step)
-		out.Summaries = make(map[string]TrendSummary, len(out.Series))
-		for i, s := range out.Series {
-			key := seriesKey(s.Labels)
-			summary := computeTrend(s.Values)
-			if stepMinutes > 0 {
-				summary.AvgPerMinute = math.Round(summary.Avg/stepMinutes*100) / 100
-			}
-			out.Summaries[key] = summary
-			out.Series[i].Values = downsampleDataPoints(s.Values, maxDataPointsPerSeries)
+	stepMinutes := stepToMinutes(out.Step)
+	summaries := make([]TrendSummary, len(out.Series))
+	for i, s := range out.Series {
+		summary := computeTrend(s.Values)
+		if stepMinutes > 0 {
+			summary.AvgPerMinute = math.Round(summary.Avg/stepMinutes*100) / 100
 		}
+		summaries[i] = summary
+	}
 
-		// Compact: keep raw data points only for top series. The model has
-		// summaries for all series — raw points are only needed for evidence.
-		if len(out.Series) > maxSampleSeries {
-			for i := maxSampleSeries; i < len(out.Series); i++ {
-				out.Series[i].Values = nil
-			}
+	// Rank series by total (desc) so the caps keep the most significant ones.
+	idx := make([]int, len(out.Series))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		return summaries[idx[a]].Total > summaries[idx[b]].Total
+	})
+
+	kept := len(idx)
+	if kept > maxSeriesReported {
+		kept = maxSeriesReported
+	}
+
+	ranked := make([]MetricSeries, 0, kept)
+	out.Summaries = make(map[string]TrendSummary, kept)
+	for rank := 0; rank < kept; rank++ {
+		i := idx[rank]
+		s := out.Series[i]
+		if rank < maxSampleSeries {
+			s.Values = downsampleDataPoints(s.Values, maxDataPointsPerSeries)
+		} else {
+			// Summaries carry the signal — raw points only for top series.
+			s.Values = nil
+		}
+		ranked = append(ranked, s)
+		out.Summaries[seriesKey(s.Labels)] = summaries[i]
+	}
+	out.Series = ranked
+
+	if out.TotalSeries > kept {
+		out.OmittedSeries = out.TotalSeries - kept
+		note := fmt.Sprintf("showing top %d of %d series by total — aggregate over fewer labels (e.g. sum by (service)) to reduce cardinality", kept, out.TotalSeries)
+		if out.Warning != "" {
+			out.Warning += " | " + note
+		} else {
+			out.Warning = note
 		}
 	}
+}
+
+// defaultLabelValuesLimit / maxLabelValuesLimit cap get_label_values responses.
+// High-cardinality labels (trace_id, pod, request_id) can return thousands of
+// values; the model needs the common ones or a filtered subset, never the full
+// set — and label discovery runs at the start of nearly every investigation.
+const (
+	defaultLabelValuesLimit = 50
+	maxLabelValuesLimit     = 200
+)
+
+// capLabelValues filters values by a case-insensitive substring, then caps the
+// result. Returns the kept values, the pre-cap total (after filtering), and
+// whether the cap truncated the list.
+func capLabelValues(values []string, contains string, limit int) ([]string, int, bool) {
+	if contains != "" {
+		needle := strings.ToLower(contains)
+		filtered := make([]string, 0, len(values))
+		for _, v := range values {
+			if strings.Contains(strings.ToLower(v), needle) {
+				filtered = append(filtered, v)
+			}
+		}
+		values = filtered
+	}
+
+	if limit <= 0 {
+		limit = defaultLabelValuesLimit
+	}
+	if limit > maxLabelValuesLimit {
+		limit = maxLabelValuesLimit
+	}
+
+	total := len(values)
+	if total > limit {
+		return values[:limit], total, true
+	}
+	return values, total, false
 }
 
 // TruncateLogLine truncates a log line to maxLogLineLength if needed,

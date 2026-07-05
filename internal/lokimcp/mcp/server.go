@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -49,6 +50,13 @@ func NewServer(source *loki.Source, piiFilter *safety.PIIFilter, auditLogger *au
 	registerLokiTools(s, source, h)
 	return s
 }
+
+// maxResultBytes caps the serialized tool result sent to the MCP client.
+// Every byte lands in the model's context and is re-read (and billed) on every
+// subsequent turn of the conversation — a result this large means the query
+// needs narrowing, not more reading. Per-tool caps (sample logs, series limits,
+// label value limits) should make this a rare backstop.
+const maxResultBytes = 30_000
 
 type mcpHandlers struct {
 	pii    *safety.PIIFilter
@@ -102,6 +110,12 @@ func (h *mcpHandlers) wrap(fn handlerFunc) server.ToolHandlerFunc {
 				}
 			}
 			text = redacted
+		}
+
+		if len(text) > maxResultBytes {
+			h.logger.Warn("tool result truncated", "tool", toolName, "bytes", len(text))
+			text = truncateUTF8(text, maxResultBytes) +
+				"\n…[TRUNCATED: result exceeded 30KB — narrow the query (shorter time range, tighter label/line filters, lower limit) or use query_stats aggregations instead of raw logs]"
 		}
 
 		return &mcp.CallToolResult{
@@ -158,17 +172,21 @@ func registerLokiTools(s *server.MCPServer, src *loki.Source, h *mcpHandlers) {
 
 	s.AddTool(
 		mcp.NewTool("get_label_values",
-			mcp.WithDescription("Get all values for a specific label (e.g. all service names, log levels). Essential for building correct LogQL queries."),
+			mcp.WithDescription("Get values for a specific label (e.g. service names, log levels). Essential for building correct LogQL queries. Returns up to 'limit' values (default 50) plus total_values; use 'contains' to search within high-cardinality labels instead of listing everything."),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("label_name", mcp.Required(), mcp.Description("The label to get values for (e.g. 'service' or 'level')")),
+			mcp.WithString("contains", mcp.Description("Case-insensitive substring filter (e.g. 'pay' to find payment-related services)")),
 			mcp.WithString("start_time", mcp.Description("Start time. Defaults to 6h ago")),
 			mcp.WithString("end_time", mcp.Description("End time. Defaults to now")),
+			mcp.WithNumber("limit", mcp.Description("Max values to return (1-200, default 50)")),
 		),
 		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
 			input := loki.GetLabelValuesInput{
 				LabelName: stringArg(args, "label_name"),
+				Contains:  stringArg(args, "contains"),
 				StartTime: stringArg(args, "start_time"),
 				EndTime:   stringArg(args, "end_time"),
+				Limit:     intArg(args, "limit"),
 			}
 			return handlers.GetLabelValues(ctx, input)
 		}),
@@ -195,6 +213,17 @@ func registerLokiTools(s *server.MCPServer, src *loki.Source, h *mcpHandlers) {
 	)
 
 	h.logger.Info("registered Loki MCP tools", "count", 4)
+}
+
+// truncateUTF8 cuts s to at most maxBytes without splitting a UTF-8 rune.
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
 }
 
 func stringArg(args map[string]any, key string) string {
