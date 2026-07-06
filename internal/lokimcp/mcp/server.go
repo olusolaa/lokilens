@@ -113,8 +113,7 @@ func (h *mcpHandlers) wrap(fn handlerFunc) server.ToolHandlerFunc {
 		}
 		if len(text) > maxResultBytes {
 			h.logger.Warn("tool result truncated", "tool", toolName, "bytes", len(text))
-			text = truncateUTF8(text, maxResultBytes) +
-				"\n…[TRUNCATED: result exceeded 30KB — narrow the query (shorter time range, tighter label/line filters, lower limit) or use query_stats aggregations instead of raw logs]"
+			text = oversizedFallbackJSON(toolName, len(text))
 		}
 
 		return &mcp.CallToolResult{
@@ -232,6 +231,28 @@ func (h *mcpHandlers) marshalAndRedact(toolName string, result any) (string, err
 		text = redacted
 	}
 	return text, nil
+}
+
+// oversizedFallbackJSON returns a small, valid JSON payload for the last-resort
+// size-budget path. Tool responses are normally JSON, so returning partial JSON
+// here makes the caller's success path harder to consume than the error itself.
+func oversizedFallbackJSON(toolName string, originalBytes int) string {
+	payload := struct {
+		Truncated     bool   `json:"truncated"`
+		Warning       string `json:"warning"`
+		Tool          string `json:"tool,omitempty"`
+		OriginalBytes int    `json:"original_bytes"`
+	}{
+		Truncated:     true,
+		Warning:       "TRUNCATED: result exceeded 30KB; narrow the query with a shorter time range, tighter label/line filters, a lower limit, or query_stats aggregations",
+		Tool:          toolName,
+		OriginalBytes: originalBytes,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return `{"truncated":true,"warning":"TRUNCATED: result exceeded 30KB; narrow the query and retry"}`
+	}
+	return string(data)
 }
 
 // truncateUTF8 cuts s to at most maxBytes without splitting a UTF-8 rune.

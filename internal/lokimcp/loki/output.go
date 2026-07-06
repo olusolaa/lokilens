@@ -80,16 +80,18 @@ const (
 // Field order matters here too — see the QueryLogsOutput comment. Summaries
 // carry the signal and are declared before the bulky raw series.
 type QueryStatsOutput struct {
-	TotalSeries       int                     `json:"total_series"`
-	OmittedSeries     int                     `json:"omitted_series,omitempty"`
-	OmittedSeriesKeys []string                `json:"omitted_series_keys,omitempty"`
-	Step              string                  `json:"step,omitempty"`
-	Query             string                  `json:"query_executed"`
-	TimeRange         string                  `json:"time_range,omitempty"`
-	Warning           string                  `json:"warning,omitempty"`
-	ExecTimeMS        int                     `json:"exec_time_ms,omitempty"`
-	Summaries         map[string]TrendSummary `json:"summaries,omitempty"`
-	Series            []MetricSeries          `json:"series"`
+	TotalSeries              int                     `json:"total_series"`
+	OmittedSeries            int                     `json:"omitted_series,omitempty"`
+	OmittedSeriesKeys        []string                `json:"omitted_series_keys,omitempty"`
+	OmittedAnomalySeries     int                     `json:"omitted_anomaly_series,omitempty"`
+	OmittedAnomalySeriesKeys []string                `json:"omitted_anomaly_series_keys,omitempty"`
+	Step                     string                  `json:"step,omitempty"`
+	Query                    string                  `json:"query_executed"`
+	TimeRange                string                  `json:"time_range,omitempty"`
+	Warning                  string                  `json:"warning,omitempty"`
+	ExecTimeMS               int                     `json:"exec_time_ms,omitempty"`
+	Summaries                map[string]TrendSummary `json:"summaries,omitempty"`
+	Series                   []MetricSeries          `json:"series"`
 }
 
 // maxLogLineLength caps individual log lines sent to the LLM.
@@ -274,12 +276,22 @@ func AnalyzeStats(out *QueryStatsOutput) {
 			if _, ok := keptSet[i]; ok {
 				continue
 			}
-			if len(out.OmittedSeriesKeys) == maxOmittedKeysListed {
-				break
+			key := seriesKey(out.Series[i].Labels)
+			if summaries[i].Anomaly != "" {
+				out.OmittedAnomalySeries++
+				if len(out.OmittedAnomalySeriesKeys) < maxOmittedKeysListed {
+					out.OmittedAnomalySeriesKeys = append(out.OmittedAnomalySeriesKeys, key)
+				}
 			}
-			out.OmittedSeriesKeys = append(out.OmittedSeriesKeys, seriesKey(out.Series[i].Labels))
+			if len(out.OmittedSeriesKeys) < maxOmittedKeysListed {
+				out.OmittedSeriesKeys = append(out.OmittedSeriesKeys, key)
+			}
 		}
-		note := fmt.Sprintf("showing top %d of %d series by total (rising/went-silent series are always kept; omitted keys listed up to %d) — aggregate over fewer labels (e.g. sum by (service)) to reduce cardinality", len(keep), out.TotalSeries, maxOmittedKeysListed)
+		anomalyNote := fmt.Sprintf("up to %d rising/went-silent series are rescued", maxAnomalySentinels)
+		if out.OmittedAnomalySeries > 0 {
+			anomalyNote = fmt.Sprintf("up to %d rising/went-silent series are rescued; %d additional anomalous series were omitted", maxAnomalySentinels, out.OmittedAnomalySeries)
+		}
+		note := fmt.Sprintf("showing top %d of %d series by total (%s; omitted keys listed up to %d) - aggregate over fewer labels (e.g. sum by (service)) to reduce cardinality", len(keep), out.TotalSeries, anomalyNote, maxOmittedKeysListed)
 		out.Warning = joinWarning(out.Warning, note)
 	}
 	out.Series = ranked
@@ -316,7 +328,7 @@ func ShrinkOversized(result any) (any, bool) {
 			return result, false
 		}
 		v.Series = nil
-		v.Warning = joinWarning(v.Warning, "result exceeded the size budget: raw series data was dropped; summaries carry the full analysis")
+		v.Warning = joinWarning(v.Warning, "result exceeded the size budget: raw series data was dropped; summaries carry the retained analysis")
 		return v, true
 	case GetLabelValuesOutput:
 		if len(v.Values) <= shrunkLabelValues {

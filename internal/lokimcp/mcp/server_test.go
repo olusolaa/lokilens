@@ -276,12 +276,28 @@ func TestMcpHandler_TruncatesOversizedResult(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	text := result.Content[0].(mcp.TextContent).Text
-	// cap + truncation notice, with slack for the appended marker
-	if len(text) > maxResultBytes+300 {
-		t.Errorf("expected result capped near %d bytes, got %d", maxResultBytes, len(text))
+	if len(text) > maxResultBytes {
+		t.Errorf("expected result capped under %d bytes, got %d", maxResultBytes, len(text))
 	}
 	if !stringContains(text, "TRUNCATED") {
 		t.Error("expected truncation notice in oversized result")
+	}
+	if !json.Valid([]byte(text)) {
+		t.Fatalf("fallback truncation must return valid JSON, got %q", text)
+	}
+	var parsed struct {
+		Truncated     bool   `json:"truncated"`
+		Warning       string `json:"warning"`
+		OriginalBytes int    `json:"original_bytes"`
+	}
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("failed to parse fallback JSON: %v", err)
+	}
+	if !parsed.Truncated {
+		t.Error("expected truncated=true")
+	}
+	if parsed.OriginalBytes <= maxResultBytes {
+		t.Errorf("expected original_bytes to report oversize payload, got %d", parsed.OriginalBytes)
 	}
 }
 

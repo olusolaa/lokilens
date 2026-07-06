@@ -1608,6 +1608,9 @@ func TestAnalyzeStats_KeepsAnomalySentinels(t *testing.T) {
 	if out.OmittedSeries != 27-maxSeriesReported {
 		t.Errorf("expected %d omitted, got %d", 27-maxSeriesReported, out.OmittedSeries)
 	}
+	if out.OmittedAnomalySeries != 0 {
+		t.Errorf("expected no omitted anomalies, got %d", out.OmittedAnomalySeries)
+	}
 	if len(out.OmittedSeriesKeys) != out.OmittedSeries {
 		t.Errorf("expected %d omitted keys listed, got %d", out.OmittedSeries, len(out.OmittedSeriesKeys))
 	}
@@ -1626,6 +1629,46 @@ func TestAnalyzeStats_KeepsAnomalySentinels(t *testing.T) {
 	}
 	if len(data) >= 30_000 {
 		t.Errorf("payload should stay under 30KB, got %d bytes", len(data))
+	}
+	if strings.Contains(out.Warning, "always kept") {
+		t.Errorf("warning must not claim anomalies are always kept: %q", out.Warning)
+	}
+	if !strings.Contains(out.Warning, "up to 5 rising/went-silent series are rescued") {
+		t.Errorf("expected bounded anomaly rescue warning, got %q", out.Warning)
+	}
+}
+
+func TestAnalyzeStats_ReportsOmittedAnomaliesBeyondSentinelCap(t *testing.T) {
+	out := &QueryStatsOutput{Step: "5m"}
+	ts := []string{"2026-07-05T10:00:00Z", "2026-07-05T10:05:00Z", "2026-07-05T10:10:00Z"}
+
+	for i := 0; i < 25; i++ {
+		v := fmt.Sprintf("%d", 100+i)
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"service": fmt.Sprintf("svc-stable-%02d", i)},
+			Values: []DataPoint{{ts[0], v}, {ts[1], v}, {ts[2], v}},
+		})
+	}
+	for i := 0; i < maxAnomalySentinels+2; i++ {
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"service": fmt.Sprintf("svc-rising-%02d", i)},
+			Values: []DataPoint{{ts[0], "0"}, {ts[1], "2"}, {ts[2], "10"}},
+		})
+	}
+
+	AnalyzeStats(out)
+
+	if out.OmittedAnomalySeries != 2 {
+		t.Fatalf("expected 2 omitted anomaly series, got %d", out.OmittedAnomalySeries)
+	}
+	if len(out.OmittedAnomalySeriesKeys) != 2 {
+		t.Fatalf("expected 2 omitted anomaly keys, got %d: %v", len(out.OmittedAnomalySeriesKeys), out.OmittedAnomalySeriesKeys)
+	}
+	if !strings.Contains(out.Warning, "2 additional anomalous series were omitted") {
+		t.Errorf("expected omitted anomaly warning, got %q", out.Warning)
+	}
+	if strings.Contains(out.Warning, "always kept") {
+		t.Errorf("warning must not claim anomalies are always kept: %q", out.Warning)
 	}
 }
 
