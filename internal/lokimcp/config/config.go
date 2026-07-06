@@ -16,6 +16,14 @@ type Config struct {
 	MaxTimeRange   time.Duration
 	MaxResults     int
 	LogLevel       string
+
+	// Prometheus metrics backend (optional). When PromBaseURL is set the
+	// metric tools are registered.
+	PromBaseURL    string
+	PromAPIKey     string
+	PromTimeout    time.Duration
+	PromMaxRetries int
+	PromMaxPoints  int
 }
 
 // LoadMCP loads config for the Loki-only MCP server.
@@ -30,10 +38,16 @@ func LoadMCP() (*Config, error) {
 		MaxTimeRange:   envDuration("MAX_TIME_RANGE", 24*time.Hour),
 		MaxResults:     envInt("MAX_RESULTS", 500),
 		LogLevel:       envOrDefault("LOG_LEVEL", "info"),
+
+		PromBaseURL:    os.Getenv("PROM_BASE_URL"),
+		PromAPIKey:     os.Getenv("PROM_API_KEY"),
+		PromTimeout:    envDuration("PROM_TIMEOUT", 30*time.Second),
+		PromMaxRetries: envInt("PROM_MAX_RETRIES", 2),
+		PromMaxPoints:  envInt("PROM_MAX_POINTS", 11000),
 	}
 
-	if cfg.LokiBaseURL == "" {
-		return nil, fmt.Errorf("missing required environment variables: LOKI_BASE_URL")
+	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" {
+		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL and/or PROM_BASE_URL")
 	}
 
 	return cfg, nil
