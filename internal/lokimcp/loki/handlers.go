@@ -33,13 +33,22 @@ type GetLabelsOutput struct {
 
 type GetLabelValuesInput struct {
 	LabelName string `json:"label_name" jsonschema_description:"The label to get values for (e.g. service or level)"`
+	Contains  string `json:"contains,omitempty" jsonschema_description:"Case-insensitive substring filter applied before the limit (e.g. 'pay' to find payment services)"`
 	StartTime string `json:"start_time,omitempty" jsonschema_description:"Start time. Defaults to 6h ago"`
 	EndTime   string `json:"end_time,omitempty" jsonschema_description:"End time. Defaults to now"`
+	Limit     int    `json:"limit,omitempty" jsonschema_description:"Max values to return (1-200, default 50)"`
 }
 
 type GetLabelValuesOutput struct {
-	LabelName string   `json:"label_name"`
-	Values    []string `json:"values"`
+	LabelName string `json:"label_name"`
+	// TotalValues counts the values matching 'contains' (all values when no
+	// filter was given); TotalLabelValues counts the label's values before
+	// filtering, so a zero-match filter is distinguishable from an empty label.
+	TotalValues      int      `json:"total_values"`
+	TotalLabelValues int      `json:"total_label_values,omitempty"`
+	Truncated        bool     `json:"truncated,omitempty"`
+	Warning          string   `json:"warning,omitempty"`
+	Values           []string `json:"values"`
 }
 
 type QueryStatsInput struct {
@@ -158,7 +167,7 @@ func (h *ToolHandlers) QueryLogs(ctx context.Context, input QueryLogsInput) (Que
 	if len(out.Logs) == 0 {
 		var hints string
 		if strings.TrimSpace(input.StartTime) == "" {
-			hints = "Searched up to 90 days back with auto-widening and found nothing. " +
+			hints = "Searched up to 30 days back with auto-widening (Loki's max range) and found nothing. " +
 				"Possible causes: (1) label names/values are wrong — call get_labels and get_label_values to verify, " +
 				"(2) the filter is too specific — try removing line filters, " +
 				"(3) the service may not be logging."
@@ -250,14 +259,31 @@ func (h *ToolHandlers) GetLabelValues(ctx context.Context, input GetLabelValuesI
 		return GetLabelValuesOutput{}, fmt.Errorf("loki label_values failed: %w", err)
 	}
 
+	values, total, truncated := capLabelValues(resp.Data, input.Contains, input.Limit)
+	out := GetLabelValuesOutput{
+		LabelName:   input.LabelName,
+		Values:      values,
+		TotalValues: total,
+		Truncated:   truncated,
+	}
+	if input.Contains != "" {
+		out.TotalLabelValues = len(resp.Data)
+		if total == 0 && len(resp.Data) > 0 {
+			out.Warning = fmt.Sprintf("no values contain %q, but the label has %d values — check the spelling or drop 'contains'",
+				input.Contains, len(resp.Data))
+		}
+	}
+	if truncated {
+		out.Warning = joinWarning(out.Warning, fmt.Sprintf("showing %d of %d values — pass 'contains' to narrow the search, or raise 'limit' (max %d)",
+			len(values), total, maxLabelValuesLimit))
+	}
+
 	h.audit.ToolInvoked("get_label_values", time.Since(start).Milliseconds(),
 		slog.String("label", input.LabelName),
-		slog.Int("result_count", len(resp.Data)),
+		slog.Int("result_count", total),
+		slog.Int("returned_count", len(values)),
 	)
-	return GetLabelValuesOutput{
-		LabelName: input.LabelName,
-		Values:    resp.Data,
-	}, nil
+	return out, nil
 }
 
 func (h *ToolHandlers) QueryStats(ctx context.Context, input QueryStatsInput) (QueryStatsOutput, error) {
@@ -351,7 +377,7 @@ func (h *ToolHandlers) QueryStats(ctx context.Context, input QueryStatsInput) (Q
 	if len(out.Series) == 0 {
 		var hints string
 		if strings.TrimSpace(input.StartTime) == "" {
-			hints = "Searched up to 90 days back with auto-widening and found nothing. " +
+			hints = "Searched up to 30 days back with auto-widening (Loki's max range) and found nothing. " +
 				"Possible causes: (1) label names/values are wrong — call get_labels and get_label_values to verify, " +
 				"(2) the query may be wrong — simplify it, " +
 				"(3) the service may not be logging."

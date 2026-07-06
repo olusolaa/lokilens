@@ -1430,3 +1430,302 @@ func absDuration(d time.Duration) time.Duration {
 	}
 	return d
 }
+
+// --- capLabelValues ---
+
+func TestCapLabelValues_UnderLimitUnchanged(t *testing.T) {
+	values := []string{"payments", "auth", "kyc"}
+	got, total, truncated := capLabelValues(values, "", 0)
+	if len(got) != 3 || total != 3 || truncated {
+		t.Errorf("expected all 3 values untruncated, got %d values, total=%d, truncated=%v", len(got), total, truncated)
+	}
+}
+
+func TestCapLabelValues_DefaultLimitApplied(t *testing.T) {
+	values := make([]string, 500)
+	for i := range values {
+		values[i] = fmt.Sprintf("pod-%d", i)
+	}
+	got, total, truncated := capLabelValues(values, "", 0)
+	if len(got) != defaultLabelValuesLimit {
+		t.Errorf("expected %d values with default limit, got %d", defaultLabelValuesLimit, len(got))
+	}
+	if total != 500 {
+		t.Errorf("expected total=500, got %d", total)
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+}
+
+func TestCapLabelValues_LimitClampedToMax(t *testing.T) {
+	values := make([]string, 500)
+	for i := range values {
+		values[i] = fmt.Sprintf("v-%d", i)
+	}
+	got, _, _ := capLabelValues(values, "", 10_000)
+	if len(got) != maxLabelValuesLimit {
+		t.Errorf("expected limit clamped to %d, got %d values", maxLabelValuesLimit, len(got))
+	}
+}
+
+func TestCapLabelValues_ContainsFilter(t *testing.T) {
+	values := []string{"payments-api", "PAYMENTS-worker", "auth-api", "kyc-service"}
+	got, total, truncated := capLabelValues(values, "payment", 0)
+	if len(got) != 2 || total != 2 {
+		t.Errorf("expected 2 case-insensitive matches, got %d (total=%d)", len(got), total)
+	}
+	if truncated {
+		t.Error("expected truncated=false for small filtered set")
+	}
+}
+
+func TestCapLabelValues_ContainsThenLimit(t *testing.T) {
+	values := make([]string, 100)
+	for i := range values {
+		values[i] = fmt.Sprintf("payments-%d", i)
+	}
+	got, total, truncated := capLabelValues(values, "payments", 10)
+	if len(got) != 10 {
+		t.Errorf("expected 10 values after limit, got %d", len(got))
+	}
+	if total != 100 {
+		t.Errorf("expected total=100 (post-filter, pre-cap), got %d", total)
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+}
+
+// --- AnalyzeStats series cap ---
+
+func TestAnalyzeStats_CapsSeriesCount(t *testing.T) {
+	out := &QueryStatsOutput{Step: "5m"}
+	for i := 0; i < 50; i++ {
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"pod": fmt.Sprintf("pod-%d", i)},
+			// series i has total = i, so pod-49 is the largest
+			Values: []DataPoint{{Timestamp: "2026-07-05T10:00:00Z", Value: fmt.Sprintf("%d", i)}},
+		})
+	}
+
+	AnalyzeStats(out)
+
+	if out.TotalSeries != 50 {
+		t.Errorf("expected TotalSeries=50, got %d", out.TotalSeries)
+	}
+	if len(out.Series) != maxSeriesReported {
+		t.Errorf("expected %d series reported, got %d", maxSeriesReported, len(out.Series))
+	}
+	if len(out.Summaries) != maxSeriesReported {
+		t.Errorf("expected %d summaries, got %d", maxSeriesReported, len(out.Summaries))
+	}
+	if out.OmittedSeries != 50-maxSeriesReported {
+		t.Errorf("expected OmittedSeries=%d, got %d", 50-maxSeriesReported, out.OmittedSeries)
+	}
+	if !strings.Contains(out.Warning, "aggregate over fewer labels") {
+		t.Errorf("expected cardinality hint in warning, got %q", out.Warning)
+	}
+	// Largest series kept first
+	if out.Series[0].Labels["pod"] != "pod-49" {
+		t.Errorf("expected largest series (pod-49) first, got %q", out.Series[0].Labels["pod"])
+	}
+	// Raw data points only for the top maxSampleSeries
+	if out.Series[0].Values == nil {
+		t.Error("expected raw values kept for top series")
+	}
+	if out.Series[maxSampleSeries].Values != nil {
+		t.Errorf("expected values nil beyond top %d series", maxSampleSeries)
+	}
+}
+
+func TestAnalyzeStats_NoCapWhenFewSeries(t *testing.T) {
+	out := &QueryStatsOutput{Step: "5m"}
+	for i := 0; i < 3; i++ {
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"service": fmt.Sprintf("svc-%d", i)},
+			Values: []DataPoint{{Timestamp: "2026-07-05T10:00:00Z", Value: "5"}},
+		})
+	}
+
+	AnalyzeStats(out)
+
+	if len(out.Series) != 3 || out.OmittedSeries != 0 {
+		t.Errorf("expected all 3 series kept with none omitted, got %d kept, %d omitted", len(out.Series), out.OmittedSeries)
+	}
+	if out.Warning != "" {
+		t.Errorf("expected no warning for small series count, got %q", out.Warning)
+	}
+}
+
+// --- Anomaly sentinels (cross-model review fixture) ---
+
+// 25 high-total stable services plus a low-total rising series and a low-total
+// went-silent series: pure volume ranking drops both anomalies; sentinel-aware
+// retention must keep them, under a valid sub-30KB JSON payload.
+func TestAnalyzeStats_KeepsAnomalySentinels(t *testing.T) {
+	out := &QueryStatsOutput{Step: "5m"}
+	ts := []string{"2026-07-05T10:00:00Z", "2026-07-05T10:05:00Z", "2026-07-05T10:10:00Z"}
+
+	for i := 0; i < 25; i++ {
+		v := fmt.Sprintf("%d", 100+i)
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"service": fmt.Sprintf("svc-stable-%02d", i)},
+			Values: []DataPoint{{ts[0], v}, {ts[1], v}, {ts[2], v}},
+		})
+	}
+	out.Series = append(out.Series, MetricSeries{
+		Labels: map[string]string{"service": "svc-rising"},
+		Values: []DataPoint{{ts[0], "0"}, {ts[1], "2"}, {ts[2], "10"}},
+	})
+	out.Series = append(out.Series, MetricSeries{
+		Labels: map[string]string{"service": "svc-dead"},
+		Values: []DataPoint{{ts[0], "50"}, {ts[1], "10"}, {ts[2], "0"}},
+	})
+
+	AnalyzeStats(out)
+
+	if len(out.Series) != maxSeriesReported {
+		t.Fatalf("expected %d series reported, got %d", maxSeriesReported, len(out.Series))
+	}
+
+	rising, ok := out.Summaries["service=svc-rising"]
+	if !ok {
+		t.Fatal("rising anomaly series was dropped by the series cap")
+	}
+	if rising.Anomaly != AnomalyRising {
+		t.Errorf("expected anomaly=%q on rising series, got %q", AnomalyRising, rising.Anomaly)
+	}
+
+	dead, ok := out.Summaries["service=svc-dead"]
+	if !ok {
+		t.Fatal("went-silent anomaly series was dropped by the series cap")
+	}
+	if dead.Anomaly != AnomalyWentSilent {
+		t.Errorf("expected anomaly=%q on went-silent series, got %q", AnomalyWentSilent, dead.Anomaly)
+	}
+
+	if out.OmittedSeries != 27-maxSeriesReported {
+		t.Errorf("expected %d omitted, got %d", 27-maxSeriesReported, out.OmittedSeries)
+	}
+	if len(out.OmittedSeriesKeys) != out.OmittedSeries {
+		t.Errorf("expected %d omitted keys listed, got %d", out.OmittedSeries, len(out.OmittedSeriesKeys))
+	}
+	for _, k := range out.OmittedSeriesKeys {
+		if k == "service=svc-rising" || k == "service=svc-dead" {
+			t.Errorf("anomaly series %q must not appear in omitted keys", k)
+		}
+	}
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if !json.Valid(data) {
+		t.Error("output is not valid JSON")
+	}
+	if len(data) >= 30_000 {
+		t.Errorf("payload should stay under 30KB, got %d bytes", len(data))
+	}
+}
+
+func TestAnalyzeStats_OmittedKeysCapped(t *testing.T) {
+	out := &QueryStatsOutput{Step: "5m"}
+	for i := 0; i < 60; i++ {
+		out.Series = append(out.Series, MetricSeries{
+			Labels: map[string]string{"pod": fmt.Sprintf("pod-%02d", i)},
+			Values: []DataPoint{{"2026-07-05T10:00:00Z", fmt.Sprintf("%d", 10+i)}},
+		})
+	}
+
+	AnalyzeStats(out)
+
+	if out.OmittedSeries != 40 {
+		t.Errorf("expected 40 omitted, got %d", out.OmittedSeries)
+	}
+	if len(out.OmittedSeriesKeys) != maxOmittedKeysListed {
+		t.Errorf("expected omitted keys capped at %d, got %d", maxOmittedKeysListed, len(out.OmittedSeriesKeys))
+	}
+}
+
+func TestClassifyAnomaly(t *testing.T) {
+	cases := []struct {
+		name string
+		in   TrendSummary
+		want string
+	}{
+		{"rising", TrendSummary{Trend: "increasing", Total: 5, Latest: 5}, AnomalyRising},
+		{"went silent", TrendSummary{Trend: "decreasing", Total: 60, Latest: 0}, AnomalyWentSilent},
+		{"stable", TrendSummary{Trend: "stable", Total: 100, Latest: 10}, ""},
+		{"never active", TrendSummary{Trend: "sparse", Total: 0, Latest: 0}, ""},
+	}
+	for _, tc := range cases {
+		if got := classifyAnomaly(tc.in); got != tc.want {
+			t.Errorf("%s: expected %q, got %q", tc.name, tc.want, got)
+		}
+	}
+}
+
+// --- ShrinkOversized ---
+
+func TestShrinkOversized_QueryLogs(t *testing.T) {
+	in := QueryLogsOutput{
+		Logs:         []LogEntry{{Timestamp: "t", Line: "x", Labels: map[string]string{"a": "b"}}},
+		UniqueLabels: map[string]map[string]int{"a": {"b": 1}},
+		TopPatterns:  []ErrorPattern{{Pattern: "p", Count: 1}},
+		Warning:      "existing",
+	}
+	got, shrunk := ShrinkOversized(in)
+	if !shrunk {
+		t.Fatal("expected shrink to apply")
+	}
+	out := got.(QueryLogsOutput)
+	if out.Logs != nil || out.UniqueLabels != nil {
+		t.Error("expected logs and unique_labels dropped")
+	}
+	if len(out.TopPatterns) != 1 {
+		t.Error("patterns must survive a shrink")
+	}
+	if !strings.Contains(out.Warning, "existing") || !strings.Contains(out.Warning, "size budget") {
+		t.Errorf("expected appended shrink warning, got %q", out.Warning)
+	}
+}
+
+func TestShrinkOversized_QueryStats(t *testing.T) {
+	in := QueryStatsOutput{
+		Series:    []MetricSeries{{Labels: map[string]string{"s": "a"}}},
+		Summaries: map[string]TrendSummary{"s=a": {Total: 1}},
+	}
+	got, shrunk := ShrinkOversized(in)
+	if !shrunk {
+		t.Fatal("expected shrink to apply")
+	}
+	out := got.(QueryStatsOutput)
+	if out.Series != nil {
+		t.Error("expected series dropped")
+	}
+	if len(out.Summaries) != 1 {
+		t.Error("summaries must survive a shrink")
+	}
+}
+
+func TestShrinkOversized_LabelValues(t *testing.T) {
+	vals := make([]string, 100)
+	for i := range vals {
+		vals[i] = fmt.Sprintf("v-%d", i)
+	}
+	got, shrunk := ShrinkOversized(GetLabelValuesOutput{Values: vals, TotalValues: 100})
+	if !shrunk {
+		t.Fatal("expected shrink to apply")
+	}
+	out := got.(GetLabelValuesOutput)
+	if len(out.Values) != shrunkLabelValues || !out.Truncated {
+		t.Errorf("expected %d values and truncated=true, got %d / %v", shrunkLabelValues, len(out.Values), out.Truncated)
+	}
+}
+
+func TestShrinkOversized_UnknownTypeNoOp(t *testing.T) {
+	if _, shrunk := ShrinkOversized(map[string]string{"a": "b"}); shrunk {
+		t.Error("unknown types must not shrink")
+	}
+}

@@ -27,8 +27,11 @@ type ErrorPattern struct {
 	Sample  string  `json:"sample"`
 }
 
+// Field order matters: encoding/json marshals in declaration order, and the
+// 30KB backstop in the MCP layer truncates from the end. Analysis fields
+// (counts, warnings, patterns, distributions) are declared before the bulky
+// raw evidence so a truncated payload loses samples, never the signal.
 type QueryLogsOutput struct {
-	Logs          []LogEntry                `json:"logs"`
 	TotalLogs     int                       `json:"total_logs"`
 	Truncated     bool                      `json:"truncated"`
 	Direction     string                    `json:"direction"`
@@ -39,6 +42,7 @@ type QueryLogsOutput struct {
 	TopPatterns   []ErrorPattern            `json:"top_patterns,omitempty"`
 	TotalPatterns int                       `json:"total_patterns,omitempty"`
 	UniqueLabels  map[string]map[string]int `json:"unique_labels,omitempty"`
+	Logs          []LogEntry                `json:"logs"`
 }
 
 type DataPoint struct {
@@ -60,17 +64,32 @@ type TrendSummary struct {
 	PeakTime     string  `json:"peak_time,omitempty"`
 	Trend        string  `json:"trend"`
 	NonZeroPct   float64 `json:"non_zero_pct"`
+	Anomaly      string  `json:"anomaly,omitempty"`
 }
 
+// Anomaly classifications attached to trend summaries. A series carrying one
+// of these is exempt from the volume-ranked series cap: a low-volume series
+// that is rising, or one that went quiet mid-window, is often the story the
+// investigation is looking for ("a service with zero logs when usually active
+// is often worse than a noisy one").
+const (
+	AnomalyRising     = "rising"      // trend is increasing — newly worsening
+	AnomalyWentSilent = "went_silent" // had activity in the window, latest point is zero
+)
+
+// Field order matters here too — see the QueryLogsOutput comment. Summaries
+// carry the signal and are declared before the bulky raw series.
 type QueryStatsOutput struct {
-	Series      []MetricSeries          `json:"series"`
-	TotalSeries int                     `json:"total_series"`
-	Step        string                  `json:"step,omitempty"`
-	Query       string                  `json:"query_executed"`
-	TimeRange   string                  `json:"time_range,omitempty"`
-	Warning     string                  `json:"warning,omitempty"`
-	ExecTimeMS  int                     `json:"exec_time_ms,omitempty"`
-	Summaries   map[string]TrendSummary `json:"summaries,omitempty"`
+	TotalSeries       int                     `json:"total_series"`
+	OmittedSeries     int                     `json:"omitted_series,omitempty"`
+	OmittedSeriesKeys []string                `json:"omitted_series_keys,omitempty"`
+	Step              string                  `json:"step,omitempty"`
+	Query             string                  `json:"query_executed"`
+	TimeRange         string                  `json:"time_range,omitempty"`
+	Warning           string                  `json:"warning,omitempty"`
+	ExecTimeMS        int                     `json:"exec_time_ms,omitempty"`
+	Summaries         map[string]TrendSummary `json:"summaries,omitempty"`
+	Series            []MetricSeries          `json:"series"`
 }
 
 // maxLogLineLength caps individual log lines sent to the LLM.
@@ -131,37 +150,222 @@ func AnalyzeLogs(out *QueryLogsOutput, limit int) {
 }
 
 // maxSampleSeries is the number of series to keep raw data points for.
-// The model has summaries (trend, peak, avg) for ALL series — raw data points
-// are only needed for a few series to support detailed follow-ups.
+// The model has summaries (trend, peak, avg) for the reported series — raw
+// data points are only needed for a few series to support detailed follow-ups.
 const maxSampleSeries = 5
 
+// maxSeriesReported caps how many series (label sets + summaries) are returned.
+// A group-by on a high-cardinality label can produce hundreds of series; each
+// one costs label maps plus a summary in the model's context on every
+// subsequent turn. Past this cap the model should aggregate over fewer labels,
+// not read more series.
+const maxSeriesReported = 20
+
+// maxAnomalySentinels bounds how many below-the-cap anomalous series (rising
+// or went-silent) are rescued into the reported set, displacing the
+// lowest-total stable series.
+const maxAnomalySentinels = 5
+
+// maxOmittedKeysListed bounds the omitted-series key list so the model can see
+// membership (and diff it across time windows) without paying for hundreds of
+// label sets.
+const maxOmittedKeysListed = 25
+
+// classifyAnomaly labels the series states that must survive the series cap.
+func classifyAnomaly(s TrendSummary) string {
+	switch {
+	case s.Trend == "increasing":
+		return AnomalyRising
+	case s.Total > 0 && s.Latest == 0:
+		return AnomalyWentSilent
+	}
+	return ""
+}
+
 // AnalyzeStats enriches a QueryStatsOutput with trend summaries and downsampling,
-// then compacts the series data. Summaries are kept for all series (they're small).
-// Raw data points are kept only for the top few series.
+// then compacts the series data. Series are ranked by total (largest first) and
+// capped at maxSeriesReported, with one exception: anomalous series (rising or
+// went-silent) below the cap displace the lowest-total stable series, because
+// pure volume ranking would drop exactly the series an investigation is
+// usually looking for. Raw data points are kept only for the top
+// maxSampleSeries of the reported set.
 func AnalyzeStats(out *QueryStatsOutput) {
 	out.TotalSeries = len(out.Series)
-
-	if len(out.Series) > 0 {
-		stepMinutes := stepToMinutes(out.Step)
-		out.Summaries = make(map[string]TrendSummary, len(out.Series))
-		for i, s := range out.Series {
-			key := seriesKey(s.Labels)
-			summary := computeTrend(s.Values)
-			if stepMinutes > 0 {
-				summary.AvgPerMinute = math.Round(summary.Avg/stepMinutes*100) / 100
-			}
-			out.Summaries[key] = summary
-			out.Series[i].Values = downsampleDataPoints(s.Values, maxDataPointsPerSeries)
-		}
-
-		// Compact: keep raw data points only for top series. The model has
-		// summaries for all series — raw points are only needed for evidence.
-		if len(out.Series) > maxSampleSeries {
-			for i := maxSampleSeries; i < len(out.Series); i++ {
-				out.Series[i].Values = nil
-			}
-		}
+	if len(out.Series) == 0 {
+		return
 	}
+
+	stepMinutes := stepToMinutes(out.Step)
+	summaries := make([]TrendSummary, len(out.Series))
+	for i, s := range out.Series {
+		summary := computeTrend(s.Values)
+		if stepMinutes > 0 {
+			summary.AvgPerMinute = math.Round(summary.Avg/stepMinutes*100) / 100
+		}
+		summary.Anomaly = classifyAnomaly(summary)
+		summaries[i] = summary
+	}
+
+	// Rank series by total (desc) so the caps keep the most significant ones.
+	idx := make([]int, len(out.Series))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		return summaries[idx[a]].Total > summaries[idx[b]].Total
+	})
+
+	keep := idx
+	rescued := 0
+	if len(idx) > maxSeriesReported {
+		keep = append([]int(nil), idx[:maxSeriesReported]...)
+
+		// Rescue anomalous series stranded below the cap by displacing the
+		// lowest-total stable series in the kept set.
+		for _, cand := range idx[maxSeriesReported:] {
+			if rescued == maxAnomalySentinels {
+				break
+			}
+			if summaries[cand].Anomaly == "" {
+				continue
+			}
+			displaced := false
+			for j := len(keep) - 1; j >= 0; j-- {
+				if summaries[keep[j]].Anomaly == "" {
+					copy(keep[j:], keep[j+1:])
+					keep[len(keep)-1] = cand
+					displaced = true
+					rescued++
+					break
+				}
+			}
+			if !displaced {
+				break // kept set is all anomalies already
+			}
+		}
+
+		sort.SliceStable(keep, func(a, b int) bool {
+			return summaries[keep[a]].Total > summaries[keep[b]].Total
+		})
+	}
+
+	keptSet := make(map[int]struct{}, len(keep))
+	for _, i := range keep {
+		keptSet[i] = struct{}{}
+	}
+
+	ranked := make([]MetricSeries, 0, len(keep))
+	out.Summaries = make(map[string]TrendSummary, len(keep))
+	for rank, i := range keep {
+		s := out.Series[i]
+		if rank < maxSampleSeries {
+			s.Values = downsampleDataPoints(s.Values, maxDataPointsPerSeries)
+		} else {
+			// Summaries carry the signal — raw points only for top series.
+			s.Values = nil
+		}
+		ranked = append(ranked, s)
+		out.Summaries[seriesKey(s.Labels)] = summaries[i]
+	}
+
+	if out.TotalSeries > len(keep) {
+		out.OmittedSeries = out.TotalSeries - len(keep)
+		for _, i := range idx {
+			if _, ok := keptSet[i]; ok {
+				continue
+			}
+			if len(out.OmittedSeriesKeys) == maxOmittedKeysListed {
+				break
+			}
+			out.OmittedSeriesKeys = append(out.OmittedSeriesKeys, seriesKey(out.Series[i].Labels))
+		}
+		note := fmt.Sprintf("showing top %d of %d series by total (rising/went-silent series are always kept; omitted keys listed up to %d) — aggregate over fewer labels (e.g. sum by (service)) to reduce cardinality", len(keep), out.TotalSeries, maxOmittedKeysListed)
+		out.Warning = joinWarning(out.Warning, note)
+	}
+	out.Series = ranked
+}
+
+// joinWarning appends a note to an existing warning string.
+func joinWarning(existing, note string) string {
+	if existing == "" {
+		return note
+	}
+	return existing + " | " + note
+}
+
+// shrunkLabelValues is how many label values survive a size-budget shrink.
+const shrunkLabelValues = 25
+
+// ShrinkOversized returns a smaller copy of a known tool output by dropping
+// the bulkiest raw evidence while keeping the analysis (patterns, summaries,
+// counts, warnings). The MCP layer calls this when a serialized result exceeds
+// the size budget, so the degraded payload stays valid JSON instead of being
+// byte-truncated. The bool reports whether anything was dropped.
+func ShrinkOversized(result any) (any, bool) {
+	switch v := result.(type) {
+	case QueryLogsOutput:
+		if len(v.Logs) == 0 && len(v.UniqueLabels) == 0 {
+			return result, false
+		}
+		v.Logs = nil
+		v.UniqueLabels = nil
+		v.Warning = joinWarning(v.Warning, "result exceeded the size budget: raw sample logs and label distributions were dropped; top_patterns and counts are complete")
+		return v, true
+	case QueryStatsOutput:
+		if len(v.Series) == 0 {
+			return result, false
+		}
+		v.Series = nil
+		v.Warning = joinWarning(v.Warning, "result exceeded the size budget: raw series data was dropped; summaries carry the full analysis")
+		return v, true
+	case GetLabelValuesOutput:
+		if len(v.Values) <= shrunkLabelValues {
+			return result, false
+		}
+		v.Values = v.Values[:shrunkLabelValues]
+		v.Truncated = true
+		v.Warning = joinWarning(v.Warning, fmt.Sprintf("result exceeded the size budget: values cut to %d — use 'contains' to narrow", shrunkLabelValues))
+		return v, true
+	}
+	return result, false
+}
+
+// defaultLabelValuesLimit / maxLabelValuesLimit cap get_label_values responses.
+// High-cardinality labels (trace_id, pod, request_id) can return thousands of
+// values; the model needs the common ones or a filtered subset, never the full
+// set — and label discovery runs at the start of nearly every investigation.
+const (
+	defaultLabelValuesLimit = 50
+	maxLabelValuesLimit     = 200
+)
+
+// capLabelValues filters values by a case-insensitive substring, then caps the
+// result. Returns the kept values, the pre-cap total (after filtering), and
+// whether the cap truncated the list.
+func capLabelValues(values []string, contains string, limit int) ([]string, int, bool) {
+	if contains != "" {
+		needle := strings.ToLower(contains)
+		filtered := make([]string, 0, len(values))
+		for _, v := range values {
+			if strings.Contains(strings.ToLower(v), needle) {
+				filtered = append(filtered, v)
+			}
+		}
+		values = filtered
+	}
+
+	if limit <= 0 {
+		limit = defaultLabelValuesLimit
+	}
+	if limit > maxLabelValuesLimit {
+		limit = maxLabelValuesLimit
+	}
+
+	total := len(values)
+	if total > limit {
+		return values[:limit], total, true
+	}
+	return values, total, false
 }
 
 // TruncateLogLine truncates a log line to maxLogLineLength if needed,

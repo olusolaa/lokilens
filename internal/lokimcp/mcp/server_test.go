@@ -258,3 +258,99 @@ func assertHasProperty(t *testing.T, tool mcp.Tool, field string) {
 		t.Errorf("tool %q: expected property %q", tool.Name, field)
 	}
 }
+
+func TestMcpHandler_TruncatesOversizedResult(t *testing.T) {
+	logger := slog.Default()
+	h := &mcpHandlers{pii: safety.NewPIIFilter(), audit: audit.New(logger), logger: logger}
+
+	big := make([]string, 0, 5000)
+	for i := 0; i < 5000; i++ {
+		big = append(big, "a-fairly-long-log-line-that-repeats-itself-endlessly")
+	}
+	handler := h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+		return map[string]any{"lines": big}, nil
+	})
+
+	result, err := handler(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	// cap + truncation notice, with slack for the appended marker
+	if len(text) > maxResultBytes+300 {
+		t.Errorf("expected result capped near %d bytes, got %d", maxResultBytes, len(text))
+	}
+	if !stringContains(text, "TRUNCATED") {
+		t.Error("expected truncation notice in oversized result")
+	}
+}
+
+func TestMcpHandler_SmallResultNotTruncated(t *testing.T) {
+	logger := slog.Default()
+	h := &mcpHandlers{pii: safety.NewPIIFilter(), audit: audit.New(logger), logger: logger}
+	handler := h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+		return map[string]string{"status": "ok"}, nil
+	})
+
+	result, err := handler(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	if stringContains(text, "TRUNCATED") {
+		t.Error("small result should not be truncated")
+	}
+}
+
+func TestNewServer_GetLabelValuesSchemaHasCapParams(t *testing.T) {
+	logger := slog.Default()
+	v := safety.NewValidator(500)
+	al := audit.New(logger)
+	src := loki.NewSource(nil, v, al)
+
+	s := NewServer(src, safety.NewPIIFilter(), al, logger)
+	tools := listTools(t, s)
+
+	glv := findTool(t, tools, "get_label_values")
+	assertHasProperty(t, glv, "contains")
+	assertHasProperty(t, glv, "limit")
+}
+
+func TestMcpHandler_ShrinksKnownTypeToValidJSON(t *testing.T) {
+	logger := slog.Default()
+	h := &mcpHandlers{pii: safety.NewPIIFilter(), audit: audit.New(logger), logger: logger}
+
+	// A QueryLogsOutput whose raw logs blow the 30KB budget: the wrapper must
+	// shrink it (drop logs, keep analysis) rather than byte-truncate it.
+	big := loki.QueryLogsOutput{
+		TopPatterns: []loki.ErrorPattern{{Pattern: "connection timeout to <*>", Count: 3000, Pct: 100, Sample: "connection timeout to 10.0.0.1"}},
+	}
+	for i := 0; i < 3000; i++ {
+		big.Logs = append(big.Logs, loki.LogEntry{
+			Timestamp: "2026-07-05T10:00:00.000Z",
+			Line:      "connection timeout to 10.0.0.1 after 30s while calling downstream",
+			Labels:    map[string]string{"service": "payments"},
+		})
+	}
+	handler := h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+		return big, nil
+	})
+
+	result, err := handler(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	if len(text) > 30_000+300 {
+		t.Errorf("expected shrunk result under budget, got %d bytes", len(text))
+	}
+	if !json.Valid([]byte(text)) {
+		t.Error("shrunk result must remain valid JSON")
+	}
+	if stringContains(text, "TRUNCATED") {
+		t.Error("known types should shrink, never byte-truncate")
+	}
+	if !stringContains(text, "top_patterns") {
+		t.Error("analysis must survive the shrink")
+	}
+}
