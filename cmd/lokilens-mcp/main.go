@@ -32,6 +32,7 @@ import (
 	"github.com/olusolaa/lokilens/internal/lokimcp/config"
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
 	mcppkg "github.com/olusolaa/lokilens/internal/lokimcp/mcp"
+	"github.com/olusolaa/lokilens/internal/lokimcp/prometheus"
 	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
 )
 
@@ -50,32 +51,63 @@ func main() {
 	}))
 
 	auditLogger := audit.New(logger)
-	lokiClient := loki.NewHTTPClient(loki.ClientConfig{
-		BaseURL:    cfg.LokiBaseURL,
-		APIKey:     cfg.LokiAPIKey,
-		Timeout:    cfg.LokiTimeout,
-		MaxRetries: cfg.LokiMaxRetries,
-		Logger:     logger,
-	})
-	validator := safety.NewValidator(cfg.MaxResults)
-	source := loki.NewSource(lokiClient, validator, auditLogger)
 
-	// Health check the backend.
+	var logSource *loki.Source
+	if cfg.LokiBaseURL != "" {
+		lokiClient := loki.NewHTTPClient(loki.ClientConfig{
+			BaseURL:    cfg.LokiBaseURL,
+			APIKey:     cfg.LokiAPIKey,
+			Timeout:    cfg.LokiTimeout,
+			MaxRetries: cfg.LokiMaxRetries,
+			Logger:     logger,
+		})
+		logSource = loki.NewSource(lokiClient, safety.NewValidator(cfg.MaxResults), auditLogger)
+	}
+
+	var metricSource *prometheus.Source
+	if cfg.PromBaseURL != "" {
+		promClient := prometheus.NewHTTPClient(prometheus.ClientConfig{
+			BaseURL:    cfg.PromBaseURL,
+			APIKey:     cfg.PromAPIKey,
+			Timeout:    cfg.PromTimeout,
+			MaxRetries: cfg.PromMaxRetries,
+			Logger:     logger,
+		})
+		metricSource = prometheus.NewSource(promClient, prometheus.NewValidator(cfg.PromMaxPoints, cfg.MaxTimeRange), auditLogger)
+	}
+
+	// Health-check each configured backend. Warn (don't fatal) if one is down,
+	// as long as at least one is healthy.
+	healthy := 0
 	checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
-	if err := source.HealthCheck(checkCtx); err != nil {
-		checkCancel()
-		log.Fatalf("health check failed (%s): %v", source.Name(), err)
+	if logSource != nil {
+		if err := logSource.HealthCheck(checkCtx); err != nil {
+			logger.Warn("log backend health check failed", "backend", logSource.Name(), "error", err)
+		} else {
+			healthy++
+			logger.Info("log backend connected", "backend", logSource.Name())
+		}
+	}
+	if metricSource != nil {
+		if err := metricSource.HealthCheck(checkCtx); err != nil {
+			logger.Warn("metric backend health check failed", "backend", metricSource.Name(), "error", err)
+		} else {
+			healthy++
+			logger.Info("metric backend connected", "backend", metricSource.Name())
+		}
 	}
 	checkCancel()
-	logger.Info("log backend connected", "backend", source.Name())
+	if healthy == 0 {
+		log.Fatalf("no backend is reachable; aborting")
+	}
 
 	// Create and run the MCP server over stdio.
 	piiFilter := safety.NewPIIFilter()
-	mcpServer := mcppkg.NewServer(source, piiFilter, auditLogger, logger)
+	mcpServer := mcppkg.NewServer(logSource, piiFilter, auditLogger, logger, mcppkg.WithMetrics(metricSource))
 	stdio := server.NewStdioServer(mcpServer)
 	stdio.SetErrorLogger(log.New(os.Stderr, "mcp: ", log.LstdFlags))
 
-	logger.Info("MCP server starting", "backend", source.Name(), "transport", "stdio")
+	logger.Info("MCP server starting", "transport", "stdio")
 
 	if err := stdio.Listen(ctx, os.Stdin, os.Stdout); err != nil {
 		log.Fatalf("mcp server: %v", err)

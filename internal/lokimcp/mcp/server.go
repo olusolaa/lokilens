@@ -15,12 +15,33 @@ import (
 
 	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
+	"github.com/olusolaa/lokilens/internal/lokimcp/prometheus"
 	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
 )
 
-// NewServer creates an MCP server with Loki tools only.
-// PII filtering and audit logging are applied to all tool results.
-func NewServer(source *loki.Source, piiFilter *safety.PIIFilter, auditLogger *audit.Logger, logger *slog.Logger) *server.MCPServer {
+// Option configures optional backends on the MCP server.
+type Option func(*serverConfig)
+
+type serverConfig struct {
+	metricSource *prometheus.Source
+}
+
+// WithMetrics registers Prometheus metric tools. Passing a nil source is a
+// no-op, so callers can wire it unconditionally.
+func WithMetrics(src *prometheus.Source) Option {
+	return func(c *serverConfig) { c.metricSource = src }
+}
+
+// NewServer creates an MCP server with log tools (Loki) and, when the
+// WithMetrics option supplies a source, metric tools (Prometheus). PII
+// filtering and audit logging are applied to all tool results.
+func NewServer(logSource *loki.Source, piiFilter *safety.PIIFilter, auditLogger *audit.Logger, logger *slog.Logger, opts ...Option) *server.MCPServer {
+	var cfg serverConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	metricSource := cfg.metricSource
+
 	s := server.NewMCPServer(
 		"lokilens",
 		"1.0.0",
@@ -28,26 +49,50 @@ func NewServer(source *loki.Source, piiFilter *safety.PIIFilter, auditLogger *au
 		server.WithPromptCapabilities(true),
 	)
 
-	s.AddPrompt(mcp.Prompt{
-		Name:        "investigation-guide",
-		Description: "Loki investigation guide with multi-step reasoning patterns for log analysis.",
-	}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-		return &mcp.GetPromptResult{
-			Description: "Loki investigation reasoning patterns",
-			Messages: []mcp.PromptMessage{
-				{
-					Role: mcp.RoleUser,
-					Content: mcp.TextContent{
-						Type: "text",
-						Text: source.Instruction(),
+	h := &mcpHandlers{pii: piiFilter, audit: auditLogger, logger: logger}
+
+	if logSource != nil {
+		s.AddPrompt(mcp.Prompt{
+			Name:        "investigation-guide",
+			Description: "Loki investigation guide with multi-step reasoning patterns for log analysis.",
+		}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Description: "Loki investigation reasoning patterns",
+				Messages: []mcp.PromptMessage{
+					{
+						Role: mcp.RoleUser,
+						Content: mcp.TextContent{
+							Type: "text",
+							Text: logSource.Instruction(),
+						},
 					},
 				},
-			},
-		}, nil
-	})
+			}, nil
+		})
+		registerLokiTools(s, logSource, h)
+	}
 
-	h := &mcpHandlers{pii: piiFilter, audit: auditLogger, logger: logger}
-	registerLokiTools(s, source, h)
+	if metricSource != nil {
+		s.AddPrompt(mcp.Prompt{
+			Name:        "metrics-investigation-guide",
+			Description: "Prometheus investigation guide for metric analysis.",
+		}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Description: "Prometheus investigation reasoning patterns",
+				Messages: []mcp.PromptMessage{
+					{
+						Role: mcp.RoleUser,
+						Content: mcp.TextContent{
+							Type: "text",
+							Text: metricSource.Instruction(),
+						},
+					},
+				},
+			}, nil
+		})
+		registerPrometheusTools(s, metricSource, h)
+	}
+
 	return s
 }
 
@@ -264,6 +309,95 @@ func truncateUTF8(s string, maxBytes int) string {
 		maxBytes--
 	}
 	return s[:maxBytes]
+}
+
+func registerPrometheusTools(s *server.MCPServer, src *prometheus.Source, h *mcpHandlers) {
+	handlers := src.Handlers()
+
+	s.AddTool(
+		mcp.NewTool("list_metrics",
+			mcp.WithDescription("List metric names in Prometheus. Call FIRST to discover which metrics exist before building PromQL. Optionally filter with a series selector."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("match", mcp.Description("Optional series selector, e.g. {job=\"node\"}")),
+			mcp.WithString("start_time", mcp.Description("Start time. Defaults to 6h ago")),
+			mcp.WithString("end_time", mcp.Description("End time. Defaults to now")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.ListMetrics(ctx, prometheus.ListMetricsInput{
+				Match:     stringArg(args, "match"),
+				StartTime: stringArg(args, "start_time"),
+				EndTime:   stringArg(args, "end_time"),
+			})
+		}),
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_metric_metadata",
+			mcp.WithDescription("Get TYPE, HELP, and unit for a metric (or all metrics). Use to understand what a metric measures before querying."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("metric", mcp.Description("Metric name. Empty returns metadata for all metrics.")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.GetMetricMetadata(ctx, prometheus.GetMetricMetadataInput{
+				Metric: stringArg(args, "metric"),
+			})
+		}),
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_metric_label_values",
+			mcp.WithDescription("Get all values for a label (e.g. instance, job, service). Essential for building correct PromQL selectors."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("label_name", mcp.Required(), mcp.Description("Label to get values for, e.g. 'instance' or 'job'")),
+			mcp.WithString("match", mcp.Description("Optional series selector to scope values")),
+			mcp.WithString("start_time", mcp.Description("Start time. Defaults to 6h ago")),
+			mcp.WithString("end_time", mcp.Description("End time. Defaults to now")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.GetMetricLabelValues(ctx, prometheus.GetMetricLabelValuesInput{
+				LabelName: stringArg(args, "label_name"),
+				Match:     stringArg(args, "match"),
+				StartTime: stringArg(args, "start_time"),
+				EndTime:   stringArg(args, "end_time"),
+			})
+		}),
+	)
+
+	s.AddTool(
+		mcp.NewTool("query_metrics_instant",
+			mcp.WithDescription("Evaluate a PromQL instant query — the current value(s). Use for 'what is X right now'."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("promql", mcp.Required(), mcp.Description("PromQL query, e.g. sum(rate(http_requests_total[5m]))")),
+			mcp.WithString("time", mcp.Description("Evaluation time — 'now' or RFC3339. Defaults to now")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.QueryInstant(ctx, prometheus.QueryInstantInput{
+				PromQL: stringArg(args, "promql"),
+				Time:   stringArg(args, "time"),
+			})
+		}),
+	)
+
+	s.AddTool(
+		mcp.NewTool("query_metrics_range",
+			mcp.WithDescription("Evaluate a PromQL range query over time. Use for trends: 'is CPU climbing?', 'error rate over the last hour'. Step is auto-bounded to keep results small."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("promql", mcp.Required(), mcp.Description("PromQL query, e.g. rate(http_requests_total[5m])")),
+			mcp.WithString("start_time", mcp.Required(), mcp.Description("Start time — relative like '1h ago' or RFC3339")),
+			mcp.WithString("end_time", mcp.Description("End time — 'now' or RFC3339. Defaults to now")),
+			mcp.WithString("step", mcp.Description("Resolution step (e.g. 30s, 1m). Auto-selected if empty.")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.QueryRange(ctx, prometheus.QueryRangeInput{
+				PromQL:    stringArg(args, "promql"),
+				StartTime: stringArg(args, "start_time"),
+				EndTime:   stringArg(args, "end_time"),
+				Step:      stringArg(args, "step"),
+			})
+		}),
+	)
+
+	h.logger.Info("registered Prometheus MCP tools", "count", 5)
 }
 
 func stringArg(args map[string]any, key string) string {
