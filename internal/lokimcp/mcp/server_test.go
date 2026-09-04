@@ -56,6 +56,79 @@ func TestNewServer_LokiToolSchemas(t *testing.T) {
 	assertRequired(t, qs, "start_time")
 }
 
+type emptyLokiClient struct{}
+
+func (emptyLokiClient) QueryRange(context.Context, loki.QueryRangeRequest) (*loki.QueryResponse, error) {
+	return &loki.QueryResponse{
+		Data: loki.QueryData{ResultType: "streams", Result: json.RawMessage(`[]`)},
+	}, nil
+}
+
+func (emptyLokiClient) Query(context.Context, loki.InstantQueryRequest) (*loki.QueryResponse, error) {
+	return nil, nil
+}
+
+func (emptyLokiClient) Labels(context.Context, loki.LabelsRequest) (*loki.LabelsResponse, error) {
+	return nil, nil
+}
+
+func (emptyLokiClient) LabelValues(context.Context, loki.LabelValuesRequest) (*loki.LabelsResponse, error) {
+	return nil, nil
+}
+
+func TestQueryLogs_EmptyResultUsesNoteOverMCP(t *testing.T) {
+	logger := slog.Default()
+	al := audit.New(logger)
+	src := loki.NewSource(emptyLokiClient{}, safety.NewValidator(500), al)
+	s := NewServer(src, safety.NewPIIFilter(), al, logger)
+
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "query_logs",
+			"arguments": map[string]any{
+				"logql":      `{service="payments"}`,
+				"start_time": "6h ago",
+			},
+		},
+	}
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	respBytes, err := json.Marshal(s.HandleMessage(context.Background(), json.RawMessage(reqBytes)))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var resp struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(respBytes, &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if len(resp.Result.Content) != 1 {
+		t.Fatalf("expected one MCP content item, got %d: %s", len(resp.Result.Content), respBytes)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resp.Result.Content[0].Text), &payload); err != nil {
+		t.Fatalf("parse tool payload: %v", err)
+	}
+	if _, ok := payload["note"]; !ok {
+		t.Fatalf("expected note field in MCP payload: %s", resp.Result.Content[0].Text)
+	}
+	if _, ok := payload["warning"]; ok {
+		t.Fatalf("did not expect warning field for retry guidance: %s", resp.Result.Content[0].Text)
+	}
+}
+
 func TestNewServer_ToolAnnotations(t *testing.T) {
 	logger := slog.Default()
 	v := safety.NewValidator(500)
