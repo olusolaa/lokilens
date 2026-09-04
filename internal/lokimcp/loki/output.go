@@ -38,6 +38,7 @@ type QueryLogsOutput struct {
 	Query         string                    `json:"query_executed"`
 	TimeRange     string                    `json:"time_range"`
 	Warning       string                    `json:"warning,omitempty"`
+	Note          string                    `json:"note,omitempty"`
 	ExecTimeMS    int                       `json:"exec_time_ms,omitempty"`
 	TopPatterns   []ErrorPattern            `json:"top_patterns,omitempty"`
 	TotalPatterns int                       `json:"total_patterns,omitempty"`
@@ -89,6 +90,7 @@ type QueryStatsOutput struct {
 	Query                    string                  `json:"query_executed"`
 	TimeRange                string                  `json:"time_range,omitempty"`
 	Warning                  string                  `json:"warning,omitempty"`
+	Note                     string                  `json:"note,omitempty"`
 	ExecTimeMS               int                     `json:"exec_time_ms,omitempty"`
 	Summaries                map[string]TrendSummary `json:"summaries,omitempty"`
 	Series                   []MetricSeries          `json:"series"`

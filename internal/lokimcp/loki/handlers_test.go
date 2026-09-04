@@ -1,13 +1,132 @@
 package loki
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
 )
+
+type staticLokiClient struct {
+	queryRangeResponse *QueryResponse
+}
+
+func (c staticLokiClient) QueryRange(context.Context, QueryRangeRequest) (*QueryResponse, error) {
+	return c.queryRangeResponse, nil
+}
+
+func (staticLokiClient) Query(context.Context, InstantQueryRequest) (*QueryResponse, error) {
+	return nil, nil
+}
+
+func (staticLokiClient) Labels(context.Context, LabelsRequest) (*LabelsResponse, error) {
+	return nil, nil
+}
+
+func (staticLokiClient) LabelValues(context.Context, LabelValuesRequest) (*LabelsResponse, error) {
+	return nil, nil
+}
+
+func newTestToolHandlers(resp *QueryResponse) *ToolHandlers {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewToolHandlers(staticLokiClient{queryRangeResponse: resp}, safety.NewValidator(500), audit.New(logger))
+}
+
+func TestQueryLogs_EmptyResultUsesDescriptiveNote(t *testing.T) {
+	resp := &QueryResponse{Data: QueryData{ResultType: "streams", Result: json.RawMessage(`[]`)}}
+	out, err := newTestToolHandlers(resp).QueryLogs(context.Background(), QueryLogsInput{
+		LogQL:     `{service="payments"}`,
+		StartTime: "6h ago",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Warning != "" {
+		t.Fatalf("expected no warning for empty-result guidance, got %q", out.Warning)
+	}
+	if !strings.Contains(out.Note, "Recommended follow-up for an empty result") {
+		t.Fatalf("expected descriptive retry note, got %q", out.Note)
+	}
+	if strings.Contains(out.Note, "MANDATORY") || strings.Contains(out.Note, "Do NOT respond") {
+		t.Fatalf("note must not read like a prompt instruction: %q", out.Note)
+	}
+
+	payload, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal output: %v", err)
+	}
+	if !strings.Contains(string(payload), `"note":`) {
+		t.Fatalf("expected serialized note field, got %s", payload)
+	}
+	if strings.Contains(string(payload), `"warning":`) {
+		t.Fatalf("did not expect serialized warning field, got %s", payload)
+	}
+}
+
+func TestQueryStats_EmptyResultUsesDescriptiveNote(t *testing.T) {
+	resp := &QueryResponse{Data: QueryData{ResultType: "matrix", Result: json.RawMessage(`[]`)}}
+	out, err := newTestToolHandlers(resp).QueryStats(context.Background(), QueryStatsInput{
+		LogQL:     `count_over_time({service="payments"}[5m])`,
+		StartTime: "6h ago",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Warning != "" {
+		t.Fatalf("expected no warning for empty-result guidance, got %q", out.Warning)
+	}
+	if !strings.Contains(out.Note, "Recommended follow-up for an empty result") {
+		t.Fatalf("expected descriptive retry note, got %q", out.Note)
+	}
+	if strings.Contains(out.Note, "MANDATORY") || strings.Contains(out.Note, "Do NOT respond") {
+		t.Fatalf("note must not read like a prompt instruction: %q", out.Note)
+	}
+}
+
+func TestQueryLogs_EmptyResultPreservesOperationalWarning(t *testing.T) {
+	resp := &QueryResponse{Data: QueryData{ResultType: "streams", Result: json.RawMessage(`[]`)}}
+	out, err := newTestToolHandlers(resp).QueryLogs(context.Background(), QueryLogsInput{
+		LogQL:     `{service="payments"}`,
+		StartTime: "now",
+		EndTime:   "1h ago",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.Warning, "swapped") {
+		t.Fatalf("expected operational warning to be preserved, got %q", out.Warning)
+	}
+	if !strings.Contains(out.Note, "Recommended follow-up for an empty result") {
+		t.Fatalf("expected descriptive retry note, got %q", out.Note)
+	}
+}
+
+func TestQueryStats_EmptyResultDescribesAutoWidenWithoutOverclaiming(t *testing.T) {
+	resp := &QueryResponse{Data: QueryData{ResultType: "matrix", Result: json.RawMessage(`[]`)}}
+	out, err := newTestToolHandlers(resp).QueryStats(context.Background(), QueryStatsInput{
+		LogQL: `count_over_time({service="payments"}[5m])`,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.Warning, "auto-widened") {
+		t.Fatalf("expected auto-widen operational warning, got %q", out.Warning)
+	}
+	if !strings.Contains(out.Note, "after auto-widening the search window") {
+		t.Fatalf("expected auto-widen note, got %q", out.Note)
+	}
+	if strings.Contains(out.Note, "30 days") {
+		t.Fatalf("note must not claim a range that the widening budget may not reach: %q", out.Note)
+	}
+}
 
 func TestBuildQueryLogsOutput_TruncatesLongLogLines(t *testing.T) {
 	longLine := strings.Repeat("x", 1500+500)

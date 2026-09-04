@@ -163,24 +163,18 @@ func (h *ToolHandlers) QueryLogs(ctx context.Context, input QueryLogsInput) (Que
 		return out, err
 	}
 
-	// Zero-results warning: different messages depending on whether auto-widening ran
+	// Keep empty-result follow-up guidance separate from operational warnings.
 	if len(out.Logs) == 0 {
-		var hints string
 		if strings.TrimSpace(input.StartTime) == "" {
-			hints = "Searched up to 30 days back with auto-widening (Loki's max range) and found nothing. " +
+			out.Note = "Empty result after auto-widening the search window. " +
 				"Possible causes: (1) label names/values are wrong — call get_labels and get_label_values to verify, " +
 				"(2) the filter is too specific — try removing line filters, " +
 				"(3) the service may not be logging."
 		} else {
-			hints = "⚠️ MANDATORY: Do NOT respond to the user yet. You MUST retry at least 2 of these before saying anything about no logs: " +
+			out.Note = "Recommended follow-up for an empty result: retry at least 2 of these checks before treating it as no activity: " +
 				"(1) widen time range to 6h or 24h, (2) remove filters (use a bare selector like {service=~\".+\"}), " +
 				"(3) call get_labels to verify label names/values exist, (4) check for typos in label values. " +
-				"Only after 2+ retries with zero results should you tell the user — and if truly empty, say it's suspicious (possible logging gap or service down), not 'no activity'."
-		}
-		if out.Warning != "" {
-			out.Warning += " | " + hints
-		} else {
-			out.Warning = hints
+				"If the retries are also empty, treat that as a possible logging gap or service outage."
 		}
 	}
 
@@ -373,24 +367,18 @@ func (h *ToolHandlers) QueryStats(ctx context.Context, input QueryStatsInput) (Q
 		return out, err
 	}
 
-	// Zero-results warning: different messages depending on whether auto-widening ran
+	// Keep empty-result follow-up guidance separate from operational warnings.
 	if len(out.Series) == 0 {
-		var hints string
 		if strings.TrimSpace(input.StartTime) == "" {
-			hints = "Searched up to 30 days back with auto-widening (Loki's max range) and found nothing. " +
+			out.Note = "Empty result after auto-widening the search window. " +
 				"Possible causes: (1) label names/values are wrong — call get_labels and get_label_values to verify, " +
 				"(2) the query may be wrong — simplify it, " +
 				"(3) the service may not be logging."
 		} else {
-			hints = "⚠️ MANDATORY: Do NOT respond to the user yet. You MUST retry at least 2 of these before saying anything about no logs: " +
+			out.Note = "Recommended follow-up for an empty result: retry at least 2 of these checks before treating it as no activity: " +
 				"(1) widen time range to 6h or 24h, (2) simplify the query, " +
 				"(3) call get_labels to verify label names/values exist. " +
-				"Only after 2+ retries with zero results should you tell the user — and if truly empty, say it's suspicious (possible logging gap or service down), not 'no activity'."
-		}
-		if out.Warning != "" {
-			out.Warning += " | " + hints
-		} else {
-			out.Warning = hints
+				"If the retries are also empty, treat that as a possible logging gap or service outage."
 		}
 	}
 
