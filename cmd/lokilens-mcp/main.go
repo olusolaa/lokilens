@@ -34,6 +34,7 @@ import (
 	mcppkg "github.com/olusolaa/lokilens/internal/lokimcp/mcp"
 	"github.com/olusolaa/lokilens/internal/lokimcp/prometheus"
 	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
+	"github.com/olusolaa/lokilens/internal/lokimcp/tempo"
 )
 
 func main() {
@@ -76,6 +77,18 @@ func main() {
 		metricSource = prometheus.NewSource(promClient, prometheus.NewValidator(cfg.PromMaxPoints, cfg.MaxTimeRange), auditLogger)
 	}
 
+	var traceSource *tempo.Source
+	if cfg.TempoBaseURL != "" {
+		tempoClient := tempo.NewHTTPClient(tempo.ClientConfig{
+			BaseURL:    cfg.TempoBaseURL,
+			APIKey:     cfg.TempoAPIKey,
+			Timeout:    cfg.TempoTimeout,
+			MaxRetries: cfg.TempoMaxRetries,
+			Logger:     logger,
+		})
+		traceSource = tempo.NewSource(tempoClient, cfg.MaxTimeRange, auditLogger)
+	}
+
 	// Health-check each configured backend. Warn (don't fatal) if one is down,
 	// as long as at least one is healthy.
 	healthy := 0
@@ -96,6 +109,14 @@ func main() {
 			logger.Info("metric backend connected", "backend", metricSource.Name())
 		}
 	}
+	if traceSource != nil {
+		if err := traceSource.HealthCheck(checkCtx); err != nil {
+			logger.Warn("trace backend health check failed", "backend", traceSource.Name(), "error", err)
+		} else {
+			healthy++
+			logger.Info("trace backend connected", "backend", traceSource.Name())
+		}
+	}
 	checkCancel()
 	if healthy == 0 {
 		log.Fatalf("no backend is reachable; aborting")
@@ -103,7 +124,7 @@ func main() {
 
 	// Create and run the MCP server over stdio.
 	piiFilter := safety.NewPIIFilter()
-	mcpServer := mcppkg.NewServer(logSource, piiFilter, auditLogger, logger, mcppkg.WithMetrics(metricSource))
+	mcpServer := mcppkg.NewServer(logSource, piiFilter, auditLogger, logger, mcppkg.WithMetrics(metricSource), mcppkg.WithTraces(traceSource))
 	stdio := server.NewStdioServer(mcpServer)
 	stdio.SetErrorLogger(log.New(os.Stderr, "mcp: ", log.LstdFlags))
 

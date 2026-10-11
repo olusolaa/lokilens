@@ -24,6 +24,11 @@ type Config struct {
 	PromTimeout    time.Duration
 	PromMaxRetries int
 	PromMaxPoints  int
+
+	TempoBaseURL    string
+	TempoAPIKey     string
+	TempoTimeout    time.Duration
+	TempoMaxRetries int
 }
 
 // LoadMCP loads config for the Loki-only MCP server.
@@ -44,10 +49,15 @@ func LoadMCP() (*Config, error) {
 		PromTimeout:    envDuration("PROM_TIMEOUT", 30*time.Second),
 		PromMaxRetries: envInt("PROM_MAX_RETRIES", 2),
 		PromMaxPoints:  envInt("PROM_MAX_POINTS", 11000),
+
+		TempoBaseURL:    os.Getenv("TEMPO_BASE_URL"),
+		TempoAPIKey:     os.Getenv("TEMPO_API_KEY"),
+		TempoTimeout:    envDuration("TEMPO_TIMEOUT", 60*time.Second),
+		TempoMaxRetries: envInt("TEMPO_MAX_RETRIES", 2),
 	}
 
-	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" {
-		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL and/or PROM_BASE_URL")
+	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" && cfg.TempoBaseURL == "" {
+		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL, PROM_BASE_URL and/or TEMPO_BASE_URL")
 	}
 
 	return cfg, nil
