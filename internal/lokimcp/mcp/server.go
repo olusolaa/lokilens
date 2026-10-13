@@ -17,6 +17,7 @@ import (
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
 	"github.com/olusolaa/lokilens/internal/lokimcp/prometheus"
 	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
+	"github.com/olusolaa/lokilens/internal/lokimcp/tempo"
 )
 
 // Option configures optional backends on the MCP server.
@@ -24,12 +25,17 @@ type Option func(*serverConfig)
 
 type serverConfig struct {
 	metricSource *prometheus.Source
+	traceSource  *tempo.Source
 }
 
 // WithMetrics registers Prometheus metric tools. Passing a nil source is a
 // no-op, so callers can wire it unconditionally.
 func WithMetrics(src *prometheus.Source) Option {
 	return func(c *serverConfig) { c.metricSource = src }
+}
+
+func WithTraces(src *tempo.Source) Option {
+	return func(c *serverConfig) { c.traceSource = src }
 }
 
 // NewServer creates an MCP server with log tools (Loki) and, when the
@@ -91,6 +97,27 @@ func NewServer(logSource *loki.Source, piiFilter *safety.PIIFilter, auditLogger 
 			}, nil
 		})
 		registerPrometheusTools(s, metricSource, h)
+	}
+
+	if traceSource := cfg.traceSource; traceSource != nil {
+		s.AddPrompt(mcp.Prompt{
+			Name:        "traces-investigation-guide",
+			Description: "Tempo investigation guide for trace analysis with TraceQL.",
+		}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Description: "Tempo investigation reasoning patterns",
+				Messages: []mcp.PromptMessage{
+					{
+						Role: mcp.RoleUser,
+						Content: mcp.TextContent{
+							Type: "text",
+							Text: traceSource.Instruction(),
+						},
+					},
+				},
+			}, nil
+		})
+		registerTempoTools(s, traceSource, h)
 	}
 
 	return s
@@ -398,6 +425,102 @@ func registerPrometheusTools(s *server.MCPServer, src *prometheus.Source, h *mcp
 	)
 
 	h.logger.Info("registered Prometheus MCP tools", "count", 5)
+}
+
+func registerTempoTools(s *server.MCPServer, src *tempo.Source, h *mcpHandlers) {
+	handlers := src.Handlers()
+
+	s.AddTool(
+		mcp.NewTool("search_traces",
+			mcp.WithDescription("Search Tempo traces with TraceQL. Returns trace summaries (root service/name, duration, per-service span and error counts, up to 3 matching spans). Use to find slow or failing requests, then call get_trace on a trace_id."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("traceql", mcp.Required(), mcp.Description("TraceQL query, e.g. {resource.service.name=\"wallet-service\" && kind=server && duration>1s} or {status=error}")),
+			mcp.WithString("start_time", mcp.Description("Start time — relative like '1h ago' or RFC3339. Defaults to 1h ago")),
+			mcp.WithString("end_time", mcp.Description("End time — 'now' or RFC3339. Defaults to now")),
+			mcp.WithNumber("limit", mcp.Description("Max traces to return (default 20, max 50)")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.SearchTraces(ctx, tempo.SearchTracesInput{
+				TraceQL:   stringArg(args, "traceql"),
+				StartTime: stringArg(args, "start_time"),
+				EndTime:   stringArg(args, "end_time"),
+				Limit:     intArg(args, "limit"),
+			})
+		}),
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_trace",
+			mcp.WithDescription("Fetch one trace by ID as a compact span tree: per-service self time (time not spent waiting on child spans; parallel calls can make the total exceed the trace duration) and error counts, all error spans, and spans ordered by start with depth, offset and duration. Large traces keep roots, errors and the slowest spans."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("trace_id", mcp.Required(), mcp.Description("Trace ID (hex), from search_traces or a log line's trace_id")),
+			mcp.WithString("service", mcp.Description("Only list spans from this service (errors and summary still cover the whole trace)")),
+			mcp.WithNumber("min_duration_ms", mcp.Description("Hide spans faster than this (roots and errors always kept)")),
+			mcp.WithNumber("max_spans", mcp.Description("Max spans to list (default 60, max 300)")),
+			mcp.WithString("start_time", mcp.Description("Optional search window start; speeds up lookups of old traces")),
+			mcp.WithString("end_time", mcp.Description("Optional search window end")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.GetTrace(ctx, tempo.GetTraceInput{
+				TraceID:       stringArg(args, "trace_id"),
+				Service:       stringArg(args, "service"),
+				MinDurationMS: floatArg(args, "min_duration_ms"),
+				MaxSpans:      intArg(args, "max_spans"),
+				StartTime:     stringArg(args, "start_time"),
+				EndTime:       stringArg(args, "end_time"),
+			})
+		}),
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_trace_tags",
+			mcp.WithDescription("List attribute names available for TraceQL, grouped by scope (resource, span, intrinsic)."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("scope", mcp.Description("Optional scope filter: resource, span, intrinsic")),
+			mcp.WithString("start_time", mcp.Description("Start time. Defaults to 1h ago")),
+			mcp.WithString("end_time", mcp.Description("End time. Defaults to now")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.GetTraceTags(ctx, tempo.GetTraceTagsInput{
+				Scope:     stringArg(args, "scope"),
+				StartTime: stringArg(args, "start_time"),
+				EndTime:   stringArg(args, "end_time"),
+			})
+		}),
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_trace_tag_values",
+			mcp.WithDescription("List values of a scoped trace attribute, e.g. resource.service.name or span.http.route. Use to build correct TraceQL filters."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("tag", mcp.Required(), mcp.Description("Scoped attribute, e.g. resource.service.name, span.rpc.method, name")),
+			mcp.WithString("traceql", mcp.Description("Optional TraceQL to scope values, e.g. {resource.service.name=\"wallet-service\"}")),
+			mcp.WithString("start_time", mcp.Description("Start time. Defaults to 1h ago")),
+			mcp.WithString("end_time", mcp.Description("End time. Defaults to now")),
+			mcp.WithNumber("limit", mcp.Description("Max values to return (default 100, max 1000)")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.GetTraceTagValues(ctx, tempo.GetTraceTagValuesInput{
+				Tag:       stringArg(args, "tag"),
+				TraceQL:   stringArg(args, "traceql"),
+				StartTime: stringArg(args, "start_time"),
+				EndTime:   stringArg(args, "end_time"),
+				Limit:     intArg(args, "limit"),
+			})
+		}),
+	)
+
+	h.logger.Info("registered Tempo MCP tools", "count", 4)
+}
+
+func floatArg(args map[string]any, key string) float64 {
+	switch v := args[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	}
+	return 0
 }
 
 func stringArg(args map[string]any, key string) string {
