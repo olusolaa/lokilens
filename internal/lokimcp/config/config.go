@@ -29,6 +29,16 @@ type Config struct {
 	TempoAPIKey     string
 	TempoTimeout    time.Duration
 	TempoMaxRetries int
+
+	GrafanaURL             string
+	GrafanaToken           string
+	GrafanaTimeout         time.Duration
+	GrafanaMaxRetries      int
+	GrafanaAthenaUID       string
+	GrafanaCloudWatchUID   string
+	AthenaMaxTimeRange     time.Duration
+	CloudWatchMaxTimeRange time.Duration
+	CloudWatchMaxPoints    int
 }
 
 // LoadMCP loads config for the Loki-only MCP server.
@@ -54,13 +64,37 @@ func LoadMCP() (*Config, error) {
 		TempoAPIKey:     os.Getenv("TEMPO_API_KEY"),
 		TempoTimeout:    envDuration("TEMPO_TIMEOUT", 60*time.Second),
 		TempoMaxRetries: envInt("TEMPO_MAX_RETRIES", 2),
+
+		GrafanaURL:             strings.TrimRight(os.Getenv("GRAFANA_URL"), "/"),
+		GrafanaToken:           os.Getenv("GRAFANA_TOKEN"),
+		GrafanaTimeout:         envDuration("GRAFANA_TIMEOUT", 120*time.Second),
+		GrafanaMaxRetries:      envInt("GRAFANA_MAX_RETRIES", 2),
+		GrafanaAthenaUID:       os.Getenv("GRAFANA_ATHENA_UID"),
+		GrafanaCloudWatchUID:   os.Getenv("GRAFANA_CLOUDWATCH_UID"),
+		AthenaMaxTimeRange:     envDuration("ATHENA_MAX_TIME_RANGE", 7*24*time.Hour),
+		CloudWatchMaxTimeRange: envDuration("CLOUDWATCH_MAX_TIME_RANGE", 7*24*time.Hour),
+		CloudWatchMaxPoints:    envInt("CLOUDWATCH_MAX_POINTS", 1440),
 	}
 
-	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" && cfg.TempoBaseURL == "" {
-		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL, PROM_BASE_URL and/or TEMPO_BASE_URL")
+	if cfg.GrafanaToken == "" {
+		if path := os.Getenv("GRAFANA_TOKEN_FILE"); path != "" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("reading GRAFANA_TOKEN_FILE: %w", err)
+			}
+			cfg.GrafanaToken = strings.TrimSpace(string(data))
+		}
+	}
+
+	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" && cfg.TempoBaseURL == "" && !cfg.GrafanaEnabled() {
+		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL, PROM_BASE_URL, TEMPO_BASE_URL and/or GRAFANA_URL with a datasource UID")
 	}
 
 	return cfg, nil
+}
+
+func (c *Config) GrafanaEnabled() bool {
+	return c.GrafanaURL != "" && (c.GrafanaAthenaUID != "" || c.GrafanaCloudWatchUID != "")
 }
 
 func loadDotEnv() {

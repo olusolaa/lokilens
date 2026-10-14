@@ -14,6 +14,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/grafana"
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
 	"github.com/olusolaa/lokilens/internal/lokimcp/prometheus"
 	"github.com/olusolaa/lokilens/internal/lokimcp/safety"
@@ -26,12 +27,17 @@ type Option func(*serverConfig)
 type serverConfig struct {
 	metricSource *prometheus.Source
 	traceSource  *tempo.Source
+	grafanaSrc   *grafana.Source
 }
 
 // WithMetrics registers Prometheus metric tools. Passing a nil source is a
 // no-op, so callers can wire it unconditionally.
 func WithMetrics(src *prometheus.Source) Option {
 	return func(c *serverConfig) { c.metricSource = src }
+}
+
+func WithGrafana(src *grafana.Source) Option {
+	return func(c *serverConfig) { c.grafanaSrc = src }
 }
 
 func WithTraces(src *tempo.Source) Option {
@@ -118,6 +124,27 @@ func NewServer(logSource *loki.Source, piiFilter *safety.PIIFilter, auditLogger 
 			}, nil
 		})
 		registerTempoTools(s, traceSource, h)
+	}
+
+	if grafanaSrc := cfg.grafanaSrc; grafanaSrc != nil {
+		s.AddPrompt(mcp.Prompt{
+			Name:        "aws-investigation-guide",
+			Description: "Guide for ALB access logs (Athena) and CloudWatch metrics via Grafana.",
+		}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Description: "Athena and CloudWatch investigation patterns",
+				Messages: []mcp.PromptMessage{
+					{
+						Role: mcp.RoleUser,
+						Content: mcp.TextContent{
+							Type: "text",
+							Text: grafanaSrc.Instruction(),
+						},
+					},
+				},
+			}, nil
+		})
+		registerGrafanaTools(s, grafanaSrc, h)
 	}
 
 	return s
@@ -511,6 +538,127 @@ func registerTempoTools(s *server.MCPServer, src *tempo.Source, h *mcpHandlers) 
 	)
 
 	h.logger.Info("registered Tempo MCP tools", "count", 4)
+}
+
+func registerGrafanaTools(s *server.MCPServer, src *grafana.Source, h *mcpHandlers) {
+	handlers := src.Handlers()
+	count := 0
+
+	if src.HasAthena() {
+		s.AddTool(
+			mcp.NewTool("describe_access_logs",
+				mcp.WithDescription("List ALB access-log tables and their columns (Athena via Grafana). Call before query_access_logs."),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithString("table", mcp.Description("Optional table name to describe only that table")),
+			),
+			h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+				return handlers.DescribeAccessLogs(ctx, grafana.DescribeInput{Table: stringArg(args, "table")})
+			}),
+		)
+		s.AddTool(
+			mcp.NewTool("query_access_logs",
+				mcp.WithDescription("Run a read-only Presto SQL query over ALB access logs in Athena. Must filter on the day partition: put $__dayFilter in WHERE and it expands to the start_time..end_time days. Prefer GROUP BY aggregates; raw rows are capped."),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithString("sql", mcp.Required(), mcp.Description("SELECT/WITH query, e.g. SELECT elb_status_code, count(*) FROM user_gateway_alb_access_logs WHERE $__dayFilter AND time >= '2026-10-14T10:00:00' GROUP BY 1")),
+				mcp.WithString("start_time", mcp.Description("Window start — relative like '6h ago' or RFC3339. Defaults to 1h ago")),
+				mcp.WithString("end_time", mcp.Description("Window end. Defaults to now")),
+				mcp.WithNumber("max_rows", mcp.Description("Row cap (default 100, max 500)")),
+			),
+			h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+				return handlers.QueryAccessLogs(ctx, grafana.AthenaQueryInput{
+					SQL:       stringArg(args, "sql"),
+					StartTime: stringArg(args, "start_time"),
+					EndTime:   stringArg(args, "end_time"),
+					MaxRows:   intArg(args, "max_rows"),
+				})
+			}),
+		)
+		count += 2
+	}
+
+	if src.HasCloudWatch() {
+		s.AddTool(
+			mcp.NewTool("list_cloudwatch_metrics",
+				mcp.WithDescription("List CloudWatch metric names in a namespace (e.g. AWS/RDS, AWS/ApplicationELB, AWS/SQS). Omit namespace to list namespaces."),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithString("namespace", mcp.Description("CloudWatch namespace, e.g. AWS/RDS")),
+				mcp.WithString("region", mcp.Description("AWS region. Defaults to the datasource region")),
+			),
+			h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+				return handlers.ListCloudWatchMetrics(ctx, grafana.ListMetricsInput{
+					Namespace: stringArg(args, "namespace"),
+					Region:    stringArg(args, "region"),
+				})
+			}),
+		)
+		s.AddTool(
+			mcp.NewTool("get_cloudwatch_dimensions",
+				mcp.WithDescription("List dimension keys for a CloudWatch metric, or the values of one key (e.g. DBInstanceIdentifier, LoadBalancer, QueueName)."),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithString("namespace", mcp.Required(), mcp.Description("CloudWatch namespace")),
+				mcp.WithString("metric", mcp.Required(), mcp.Description("Metric name")),
+				mcp.WithString("key", mcp.Description("Dimension key to list values for. Omit to list keys")),
+				mcp.WithString("region", mcp.Description("AWS region. Defaults to the datasource region")),
+				mcp.WithNumber("limit", mcp.Description("Max values (default 100, max 1000)")),
+			),
+			h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+				return handlers.GetCloudWatchDimensions(ctx, grafana.DimensionsInput{
+					Namespace: stringArg(args, "namespace"),
+					Metric:    stringArg(args, "metric"),
+					Key:       stringArg(args, "key"),
+					Region:    stringArg(args, "region"),
+					Limit:     intArg(args, "limit"),
+				})
+			}),
+		)
+		s.AddTool(
+			mcp.NewTool("query_cloudwatch",
+				mcp.WithDescription("Query a CloudWatch metric over time with trend summaries. Period auto-bounds to keep results small. Count metrics publish nothing while zero."),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithString("namespace", mcp.Required(), mcp.Description("CloudWatch namespace, e.g. AWS/RDS")),
+				mcp.WithString("metric", mcp.Required(), mcp.Description("Metric name, e.g. CommitLatency")),
+				mcp.WithObject("dimensions", mcp.Description("Dimension name to value, e.g. {\"DBInstanceIdentifier\":\"grey-aurora-db-transaction-prod-instance\"}. Use \"*\" to match all")),
+				mcp.WithString("statistic", mcp.Description("Average (default), Sum, Maximum, Minimum, SampleCount, or a percentile like p99")),
+				mcp.WithNumber("period", mcp.Description("Seconds per point, multiple of 60. Auto-raised to stay under the point cap")),
+				mcp.WithString("start_time", mcp.Description("Start — relative like '6h ago' or RFC3339. Defaults to 1h ago")),
+				mcp.WithString("end_time", mcp.Description("End. Defaults to now")),
+				mcp.WithString("region", mcp.Description("AWS region. Defaults to the datasource region")),
+			),
+			h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+				return handlers.QueryCloudWatch(ctx, grafana.CloudWatchQueryInput{
+					Namespace:  stringArg(args, "namespace"),
+					Metric:     stringArg(args, "metric"),
+					Dimensions: stringMapArg(args, "dimensions"),
+					Statistic:  stringArg(args, "statistic"),
+					Period:     intArg(args, "period"),
+					StartTime:  stringArg(args, "start_time"),
+					EndTime:    stringArg(args, "end_time"),
+					Region:     stringArg(args, "region"),
+				})
+			}),
+		)
+		count += 3
+	}
+
+	h.logger.Info("registered Grafana MCP tools", "count", count)
+}
+
+func stringMapArg(args map[string]any, key string) map[string]string {
+	out := map[string]string{}
+	switch v := args[key].(type) {
+	case map[string]any:
+		for k, val := range v {
+			out[k] = fmt.Sprint(val)
+		}
+	case string:
+		var m map[string]any
+		if json.Unmarshal([]byte(v), &m) == nil {
+			for k, val := range m {
+				out[k] = fmt.Sprint(val)
+			}
+		}
+	}
+	return out
 }
 
 func floatArg(args map[string]any, key string) float64 {

@@ -30,6 +30,7 @@ import (
 
 	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
 	"github.com/olusolaa/lokilens/internal/lokimcp/config"
+	"github.com/olusolaa/lokilens/internal/lokimcp/grafana"
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
 	mcppkg "github.com/olusolaa/lokilens/internal/lokimcp/mcp"
 	"github.com/olusolaa/lokilens/internal/lokimcp/prometheus"
@@ -89,6 +90,24 @@ func main() {
 		traceSource = tempo.NewSource(tempoClient, cfg.MaxTimeRange, auditLogger)
 	}
 
+	var grafanaSource *grafana.Source
+	if cfg.GrafanaEnabled() {
+		grafanaClient := grafana.NewHTTPClient(grafana.ClientConfig{
+			BaseURL:    cfg.GrafanaURL,
+			Token:      cfg.GrafanaToken,
+			Timeout:    cfg.GrafanaTimeout,
+			MaxRetries: cfg.GrafanaMaxRetries,
+			Logger:     logger,
+		})
+		grafanaSource = grafana.NewSource(grafanaClient, grafana.HandlerConfig{
+			AthenaUID:           cfg.GrafanaAthenaUID,
+			CloudWatchUID:       cfg.GrafanaCloudWatchUID,
+			AthenaMaxRange:      cfg.AthenaMaxTimeRange,
+			CloudWatchMaxRange:  cfg.CloudWatchMaxTimeRange,
+			CloudWatchMaxPoints: cfg.CloudWatchMaxPoints,
+		}, auditLogger)
+	}
+
 	// Health-check each configured backend. Warn (don't fatal) if one is down,
 	// as long as at least one is healthy.
 	healthy := 0
@@ -117,6 +136,14 @@ func main() {
 			logger.Info("trace backend connected", "backend", traceSource.Name())
 		}
 	}
+	if grafanaSource != nil {
+		if err := grafanaSource.HealthCheck(checkCtx); err != nil {
+			logger.Warn("grafana backend health check failed", "backend", grafanaSource.Name(), "error", err)
+		} else {
+			healthy++
+			logger.Info("grafana backend connected", "backend", grafanaSource.Name())
+		}
+	}
 	checkCancel()
 	if healthy == 0 {
 		log.Fatalf("no backend is reachable; aborting")
@@ -124,7 +151,7 @@ func main() {
 
 	// Create and run the MCP server over stdio.
 	piiFilter := safety.NewPIIFilter()
-	mcpServer := mcppkg.NewServer(logSource, piiFilter, auditLogger, logger, mcppkg.WithMetrics(metricSource), mcppkg.WithTraces(traceSource))
+	mcpServer := mcppkg.NewServer(logSource, piiFilter, auditLogger, logger, mcppkg.WithMetrics(metricSource), mcppkg.WithTraces(traceSource), mcppkg.WithGrafana(grafanaSource))
 	stdio := server.NewStdioServer(mcpServer)
 	stdio.SetErrorLogger(log.New(os.Stderr, "mcp: ", log.LstdFlags))
 
