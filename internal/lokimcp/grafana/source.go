@@ -19,6 +19,7 @@ func (s *Source) Name() string            { return "Grafana" }
 func (s *Source) Handlers() *ToolHandlers { return s.handlers }
 func (s *Source) HasAthena() bool         { return s.handlers.athenaUID != "" }
 func (s *Source) HasCloudWatch() bool     { return s.handlers.cloudWatchUID != "" }
+func (s *Source) HasPostgres() bool       { return len(s.handlers.postgresUIDs) > 0 }
 
 func (s *Source) Instruction() string {
 	text := ""
@@ -27,6 +28,9 @@ func (s *Source) Instruction() string {
 	}
 	if s.HasCloudWatch() {
 		text += cloudWatchInstruction
+	}
+	if s.HasPostgres() {
+		text += postgresInstruction
 	}
 	return text
 }
@@ -56,4 +60,10 @@ const cloudWatchInstruction = `AWS CloudWatch metrics (via Grafana):
 2. get_cloudwatch_dimensions to find dimension keys, then values (e.g. DBInstanceIdentifier, LoadBalancer, QueueName).
 3. query_cloudwatch with exact dimensions. Use "*" as a dimension value to match all.
 Aurora PostgreSQL has no DMLLatency; use ReadLatency, WriteLatency, CommitLatency. Count metrics publish nothing while zero.
+`
+
+const postgresInstruction = `PostgreSQL query plans (EXPLAIN via Grafana):
+1. explain_query with a database name and one SELECT, WITH or VALUES statement. It returns the plan only; the query is never executed and no rows are returned.
+2. On PostgreSQL 16 databases pass $1-style placeholders (GENERIC_PLAN), e.g. the exact text from pg_stat_statements. audit and grey-db-prod run PostgreSQL 14: use literal values there.
+3. Prefer reader databases (transaction reader-1, grey-db-prod-replica:*); planner statistics are shared with the writer, so plans match.
 `

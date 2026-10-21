@@ -13,6 +13,7 @@ type HandlerConfig struct {
 	AthenaMaxRange      time.Duration
 	CloudWatchMaxRange  time.Duration
 	CloudWatchMaxPoints int
+	PostgresDatasources map[string]string
 }
 
 type ToolHandlers struct {
@@ -23,6 +24,8 @@ type ToolHandlers struct {
 	athenaMaxRange      time.Duration
 	cloudWatchMaxRange  time.Duration
 	cloudWatchMaxPoints int
+	postgresUIDs        map[string]string
+	postgresNames       []string
 
 	mu       sync.Mutex
 	athenaDB string
@@ -46,6 +49,8 @@ func NewToolHandlers(client Client, cfg HandlerConfig, auditLogger *audit.Logger
 		athenaMaxRange:      cfg.AthenaMaxRange,
 		cloudWatchMaxRange:  cfg.CloudWatchMaxRange,
 		cloudWatchMaxPoints: cfg.CloudWatchMaxPoints,
+		postgresUIDs:        cfg.PostgresDatasources,
+		postgresNames:       sortedNames(cfg.PostgresDatasources),
 	}
 }
 

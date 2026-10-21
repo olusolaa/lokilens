@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -129,10 +130,10 @@ func NewServer(logSource *loki.Source, piiFilter *safety.PIIFilter, auditLogger 
 	if grafanaSrc := cfg.grafanaSrc; grafanaSrc != nil {
 		s.AddPrompt(mcp.Prompt{
 			Name:        "aws-investigation-guide",
-			Description: "Guide for ALB access logs (Athena) and CloudWatch metrics via Grafana.",
+			Description: "Guide for ALB access logs (Athena), CloudWatch metrics and PostgreSQL query plans via Grafana.",
 		}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
 			return &mcp.GetPromptResult{
-				Description: "Athena and CloudWatch investigation patterns",
+				Description: "Athena, CloudWatch and PostgreSQL EXPLAIN investigation patterns",
 				Messages: []mcp.PromptMessage{
 					{
 						Role: mcp.RoleUser,
@@ -638,6 +639,24 @@ func registerGrafanaTools(s *server.MCPServer, src *grafana.Source, h *mcpHandle
 			}),
 		)
 		count += 3
+	}
+
+	if src.HasPostgres() {
+		s.AddTool(
+			mcp.NewTool("explain_query",
+				mcp.WithDescription("Show the PostgreSQL query plan (EXPLAIN, never ANALYZE) for one SELECT/WITH/VALUES statement. The query is not executed and no rows are returned. Databases: "+strings.Join(handlers.PostgresDatabases(), ", ")),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithString("database", mcp.Required(), mcp.Description("Database name from the list in the tool description; prefer readers")),
+				mcp.WithString("query", mcp.Required(), mcp.Description("A single SELECT, WITH or VALUES statement. $1-style placeholders work on PostgreSQL 16; use literals on audit and grey-db-prod")),
+			),
+			h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+				return handlers.ExplainQuery(ctx, grafana.ExplainInput{
+					Database: stringArg(args, "database"),
+					Query:    stringArg(args, "query"),
+				})
+			}),
+		)
+		count++
 	}
 
 	h.logger.Info("registered Grafana MCP tools", "count", count)
