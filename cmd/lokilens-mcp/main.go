@@ -105,6 +105,7 @@ func main() {
 			AthenaMaxRange:      cfg.AthenaMaxTimeRange,
 			CloudWatchMaxRange:  cfg.CloudWatchMaxTimeRange,
 			CloudWatchMaxPoints: cfg.CloudWatchMaxPoints,
+			PostgresDatasources: cfg.GrafanaPostgresDatasources,
 		}, auditLogger)
 	}
 

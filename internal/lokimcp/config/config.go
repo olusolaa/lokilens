@@ -30,15 +30,16 @@ type Config struct {
 	TempoTimeout    time.Duration
 	TempoMaxRetries int
 
-	GrafanaURL             string
-	GrafanaToken           string
-	GrafanaTimeout         time.Duration
-	GrafanaMaxRetries      int
-	GrafanaAthenaUID       string
-	GrafanaCloudWatchUID   string
-	AthenaMaxTimeRange     time.Duration
-	CloudWatchMaxTimeRange time.Duration
-	CloudWatchMaxPoints    int
+	GrafanaURL                 string
+	GrafanaToken               string
+	GrafanaTimeout             time.Duration
+	GrafanaMaxRetries          int
+	GrafanaAthenaUID           string
+	GrafanaCloudWatchUID       string
+	AthenaMaxTimeRange         time.Duration
+	CloudWatchMaxTimeRange     time.Duration
+	CloudWatchMaxPoints        int
+	GrafanaPostgresDatasources map[string]string
 }
 
 // LoadMCP loads config for the Loki-only MCP server.
@@ -86,6 +87,12 @@ func LoadMCP() (*Config, error) {
 		}
 	}
 
+	datasources, err := parseDatasourceMap(os.Getenv("GRAFANA_POSTGRES_DATASOURCES"))
+	if err != nil {
+		return nil, fmt.Errorf("GRAFANA_POSTGRES_DATASOURCES: %w", err)
+	}
+	cfg.GrafanaPostgresDatasources = datasources
+
 	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" && cfg.TempoBaseURL == "" && !cfg.GrafanaEnabled() {
 		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL, PROM_BASE_URL, TEMPO_BASE_URL and/or GRAFANA_URL with a datasource UID")
 	}
@@ -94,7 +101,24 @@ func LoadMCP() (*Config, error) {
 }
 
 func (c *Config) GrafanaEnabled() bool {
-	return c.GrafanaURL != "" && (c.GrafanaAthenaUID != "" || c.GrafanaCloudWatchUID != "")
+	return c.GrafanaURL != "" && (c.GrafanaAthenaUID != "" || c.GrafanaCloudWatchUID != "" || len(c.GrafanaPostgresDatasources) > 0)
+}
+
+func parseDatasourceMap(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, uid, ok := strings.Cut(entry, "=")
+		name, uid = strings.TrimSpace(name), strings.TrimSpace(uid)
+		if !ok || name == "" || uid == "" {
+			return nil, fmt.Errorf("entry %q must be name=uid", entry)
+		}
+		out[name] = uid
+	}
+	return out, nil
 }
 
 func loadDotEnv() {

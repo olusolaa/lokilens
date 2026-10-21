@@ -43,3 +43,19 @@ func TestLoadMCP_LokiOnlyStillValid(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestParseDatasourceMap(t *testing.T) {
+	got, err := parseDatasourceMap(" grey-db-prod-replica:card-db=pg-abc , grey-db-audit-prod=pg-def,")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got["grey-db-prod-replica:card-db"] != "pg-abc" || got["grey-db-audit-prod"] != "pg-def" {
+		t.Fatalf("got %v", got)
+	}
+	if empty, err := parseDatasourceMap(""); err != nil || len(empty) != 0 {
+		t.Fatalf("empty: %v %v", empty, err)
+	}
+	if _, err := parseDatasourceMap("missing-uid"); err == nil {
+		t.Fatal("expected error for entry without =")
+	}
+}
