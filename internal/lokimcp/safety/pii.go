@@ -100,6 +100,20 @@ func NewPIIFilter() *PIIFilter {
 	}
 }
 
+func (f *PIIFilter) Without(names ...string) *PIIFilter {
+	skip := make(map[string]bool, len(names))
+	for _, n := range names {
+		skip[n] = true
+	}
+	out := &PIIFilter{}
+	for _, p := range f.patterns {
+		if !skip[p.name] {
+			out.patterns = append(out.patterns, p)
+		}
+	}
+	return out
+}
+
 // Redact replaces PII patterns in text with redaction markers.
 func (f *PIIFilter) Redact(text string) string {
 	for _, p := range f.patterns {

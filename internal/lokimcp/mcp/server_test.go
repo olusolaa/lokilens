@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -441,5 +442,32 @@ func TestMcpHandler_ShrinksKnownTypeToValidJSON(t *testing.T) {
 	}
 	if !stringContains(text, "top_patterns") {
 		t.Error("analysis must survive the shrink")
+	}
+}
+
+func TestMcpHandler_ToolPIIOverride(t *testing.T) {
+	logger := slog.Default()
+	h := &mcpHandlers{pii: safety.NewPIIFilter(), audit: audit.New(logger), logger: logger}
+	h.setToolPII("query_cloudflare", h.pii.Without("ipv4"))
+	handler := h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+		return map[string]string{"ip": "8.8.8.8", "email": "john@example.com"}, nil
+	})
+	call := func(name string) string {
+		req := mcp.CallToolRequest{}
+		req.Params.Name = name
+		result, err := handler(context.Background(), req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return result.Content[0].(mcp.TextContent).Text
+	}
+
+	cf := call("query_cloudflare")
+	if !strings.Contains(cf, "8.8.8.8") || strings.Contains(cf, "john@example.com") {
+		t.Errorf("query_cloudflare: want IP kept and email redacted, got %s", cf)
+	}
+	other := call("query_logs")
+	if strings.Contains(other, "8.8.8.8") {
+		t.Errorf("query_logs: want IP redacted, got %s", other)
 	}
 }

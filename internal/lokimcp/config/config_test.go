@@ -59,3 +59,56 @@ func TestParseDatasourceMap(t *testing.T) {
 		t.Fatal("expected error for entry without =")
 	}
 }
+
+func TestParseZoneMap(t *testing.T) {
+	got, err := parseZoneMap(" grey.engineering=e58607c2de82ee0a6495d4a4c92d981b , grey.co=ce068f01875cb464a6aface167b0510b,")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got["grey.engineering"] != "e58607c2de82ee0a6495d4a4c92d981b" || got["grey.co"] != "ce068f01875cb464a6aface167b0510b" {
+		t.Fatalf("got %v", got)
+	}
+	if empty, err := parseZoneMap(""); err != nil || len(empty) != 0 {
+		t.Fatalf("empty: %v %v", empty, err)
+	}
+	for _, bad := range []string{"missing-tag", "=abc", "name=", "name=a b", `name=a"b`, "a=abc,a=def"} {
+		if _, err := parseZoneMap(bad); err == nil {
+			t.Fatalf("expected error for %q", bad)
+		}
+	}
+}
+
+func TestLoadMCP_CloudflareOnlyIsValid(t *testing.T) {
+	clearEnv(t)
+	os.Setenv("CLOUDFLARE_API_TOKEN", "tok")
+	os.Setenv("CLOUDFLARE_ZONES", "grey.co=ce068f01875cb464a6aface167b0510b")
+	defer os.Unsetenv("CLOUDFLARE_API_TOKEN")
+	defer os.Unsetenv("CLOUDFLARE_ZONES")
+	cfg, err := LoadMCP()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.CloudflareEnabled() || cfg.CloudflareMaxTimeRange.Hours() != 168 || cfg.CloudflareMaxRetries != 2 || cfg.CloudflareTimeout.Seconds() != 30 {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+}
+
+func TestLoadMCP_CloudflareTokenWithoutZonesIsNotABackend(t *testing.T) {
+	clearEnv(t)
+	os.Setenv("CLOUDFLARE_API_TOKEN", "tok")
+	defer os.Unsetenv("CLOUDFLARE_API_TOKEN")
+	if _, err := LoadMCP(); err == nil {
+		t.Fatal("expected error when only the token is set")
+	}
+}
+
+func TestLoadMCP_MalformedCloudflareZones(t *testing.T) {
+	clearEnv(t)
+	os.Setenv("LOKI_BASE_URL", "http://localhost:3100")
+	os.Setenv("CLOUDFLARE_ZONES", "broken")
+	defer os.Unsetenv("LOKI_BASE_URL")
+	defer os.Unsetenv("CLOUDFLARE_ZONES")
+	if _, err := LoadMCP(); err == nil {
+		t.Fatal("expected config error for malformed CLOUDFLARE_ZONES")
+	}
+}

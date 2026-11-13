@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,12 @@ type Config struct {
 	TempoAPIKey     string
 	TempoTimeout    time.Duration
 	TempoMaxRetries int
+
+	CloudflareAPIToken     string
+	CloudflareZones        map[string]string
+	CloudflareTimeout      time.Duration
+	CloudflareMaxRetries   int
+	CloudflareMaxTimeRange time.Duration
 
 	GrafanaURL                 string
 	GrafanaToken               string
@@ -66,6 +73,11 @@ func LoadMCP() (*Config, error) {
 		TempoTimeout:    envDuration("TEMPO_TIMEOUT", 60*time.Second),
 		TempoMaxRetries: envInt("TEMPO_MAX_RETRIES", 2),
 
+		CloudflareAPIToken:     os.Getenv("CLOUDFLARE_API_TOKEN"),
+		CloudflareTimeout:      envDuration("CLOUDFLARE_TIMEOUT", 30*time.Second),
+		CloudflareMaxRetries:   envInt("CLOUDFLARE_MAX_RETRIES", 2),
+		CloudflareMaxTimeRange: envDuration("CLOUDFLARE_MAX_TIME_RANGE", 168*time.Hour),
+
 		GrafanaURL:             strings.TrimRight(os.Getenv("GRAFANA_URL"), "/"),
 		GrafanaToken:           os.Getenv("GRAFANA_TOKEN"),
 		GrafanaTimeout:         envDuration("GRAFANA_TIMEOUT", 120*time.Second),
@@ -87,14 +99,30 @@ func LoadMCP() (*Config, error) {
 		}
 	}
 
+	if cfg.CloudflareAPIToken == "" {
+		if path := os.Getenv("CLOUDFLARE_API_TOKEN_FILE"); path != "" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("reading CLOUDFLARE_API_TOKEN_FILE: %w", err)
+			}
+			cfg.CloudflareAPIToken = strings.TrimSpace(string(data))
+		}
+	}
+
 	datasources, err := parseDatasourceMap(os.Getenv("GRAFANA_POSTGRES_DATASOURCES"))
 	if err != nil {
 		return nil, fmt.Errorf("GRAFANA_POSTGRES_DATASOURCES: %w", err)
 	}
 	cfg.GrafanaPostgresDatasources = datasources
 
-	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" && cfg.TempoBaseURL == "" && !cfg.GrafanaEnabled() {
-		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL, PROM_BASE_URL, TEMPO_BASE_URL and/or GRAFANA_URL with a datasource UID")
+	zones, err := parseZoneMap(os.Getenv("CLOUDFLARE_ZONES"))
+	if err != nil {
+		return nil, fmt.Errorf("CLOUDFLARE_ZONES: %w", err)
+	}
+	cfg.CloudflareZones = zones
+
+	if cfg.LokiBaseURL == "" && cfg.PromBaseURL == "" && cfg.TempoBaseURL == "" && !cfg.GrafanaEnabled() && !cfg.CloudflareEnabled() {
+		return nil, fmt.Errorf("at least one backend required: set LOKI_BASE_URL, PROM_BASE_URL, TEMPO_BASE_URL, GRAFANA_URL with a datasource UID and/or CLOUDFLARE_API_TOKEN with CLOUDFLARE_ZONES")
 	}
 
 	return cfg, nil
@@ -102,6 +130,35 @@ func LoadMCP() (*Config, error) {
 
 func (c *Config) GrafanaEnabled() bool {
 	return c.GrafanaURL != "" && (c.GrafanaAthenaUID != "" || c.GrafanaCloudWatchUID != "" || len(c.GrafanaPostgresDatasources) > 0)
+}
+
+func (c *Config) CloudflareEnabled() bool {
+	return c.CloudflareAPIToken != "" && len(c.CloudflareZones) > 0
+}
+
+var zoneTagRe = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+
+func parseZoneMap(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, tag, ok := strings.Cut(entry, "=")
+		name, tag = strings.TrimSpace(name), strings.TrimSpace(tag)
+		if !ok || name == "" || tag == "" {
+			return nil, fmt.Errorf("entry %q must be name=zoneTag", entry)
+		}
+		if !zoneTagRe.MatchString(tag) {
+			return nil, fmt.Errorf("entry %q has an invalid zoneTag", entry)
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("duplicate zone name %q", name)
+		}
+		out[name] = tag
+	}
+	return out, nil
 }
 
 func parseDatasourceMap(raw string) (map[string]string, error) {
