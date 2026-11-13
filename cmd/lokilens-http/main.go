@@ -21,6 +21,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/cloudflare"
 	"github.com/olusolaa/lokilens/internal/lokimcp/config"
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
 	mcppkg "github.com/olusolaa/lokilens/internal/lokimcp/mcp"
@@ -59,8 +60,26 @@ func main() {
 	checkCancel()
 	logger.Info("log backend connected", "backend", source.Name())
 
+	var cloudflareSource *cloudflare.Source
+	if cfg.CloudflareEnabled() {
+		cloudflareClient := cloudflare.NewHTTPClient(cloudflare.ClientConfig{
+			APIToken:   cfg.CloudflareAPIToken,
+			Timeout:    cfg.CloudflareTimeout,
+			MaxRetries: cfg.CloudflareMaxRetries,
+			Logger:     logger,
+		})
+		cloudflareSource = cloudflare.NewSource(cloudflareClient, cfg.CloudflareZones, cfg.CloudflareMaxTimeRange, auditLogger)
+		cfCheckCtx, cfCheckCancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := cloudflareSource.HealthCheck(cfCheckCtx); err != nil {
+			cfCheckCancel()
+			log.Fatalf("health check failed (%s): %v", cloudflareSource.Name(), err)
+		}
+		cfCheckCancel()
+		logger.Info("cloudflare backend connected", "backend", cloudflareSource.Name())
+	}
+
 	piiFilter := safety.NewPIIFilter()
-	mcpServer := mcppkg.NewServer(source, piiFilter, auditLogger, logger)
+	mcpServer := mcppkg.NewServer(source, piiFilter, auditLogger, logger, mcppkg.WithCloudflare(cloudflareSource))
 
 	addr := os.Getenv("MCP_HTTP_ADDR")
 	if addr == "" {

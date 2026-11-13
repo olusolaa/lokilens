@@ -15,6 +15,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/cloudflare"
 	"github.com/olusolaa/lokilens/internal/lokimcp/grafana"
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
 	"github.com/olusolaa/lokilens/internal/lokimcp/prometheus"
@@ -26,9 +27,10 @@ import (
 type Option func(*serverConfig)
 
 type serverConfig struct {
-	metricSource *prometheus.Source
-	traceSource  *tempo.Source
-	grafanaSrc   *grafana.Source
+	metricSource  *prometheus.Source
+	traceSource   *tempo.Source
+	grafanaSrc    *grafana.Source
+	cloudflareSrc *cloudflare.Source
 }
 
 // WithMetrics registers Prometheus metric tools. Passing a nil source is a
@@ -39,6 +41,10 @@ func WithMetrics(src *prometheus.Source) Option {
 
 func WithGrafana(src *grafana.Source) Option {
 	return func(c *serverConfig) { c.grafanaSrc = src }
+}
+
+func WithCloudflare(src *cloudflare.Source) Option {
+	return func(c *serverConfig) { c.cloudflareSrc = src }
 }
 
 func WithTraces(src *tempo.Source) Option {
@@ -148,6 +154,27 @@ func NewServer(logSource *loki.Source, piiFilter *safety.PIIFilter, auditLogger 
 		registerGrafanaTools(s, grafanaSrc, h)
 	}
 
+	if cloudflareSrc := cfg.cloudflareSrc; cloudflareSrc != nil {
+		s.AddPrompt(mcp.Prompt{
+			Name:        "cloudflare-investigation-guide",
+			Description: "Cloudflare GraphQL Analytics guide for edge traffic and WAF analysis.",
+		}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Description: "Cloudflare edge traffic and WAF investigation patterns",
+				Messages: []mcp.PromptMessage{
+					{
+						Role: mcp.RoleUser,
+						Content: mcp.TextContent{
+							Type: "text",
+							Text: cloudflareSrc.Instruction(),
+						},
+					},
+				},
+			}, nil
+		})
+		registerCloudflareTools(s, cloudflareSrc, h)
+	}
+
 	return s
 }
 
@@ -159,9 +186,17 @@ func NewServer(logSource *loki.Source, piiFilter *safety.PIIFilter, auditLogger 
 const maxResultBytes = 30_000
 
 type mcpHandlers struct {
-	pii    *safety.PIIFilter
-	audit  *audit.Logger
-	logger *slog.Logger
+	pii       *safety.PIIFilter
+	piiByTool map[string]*safety.PIIFilter
+	audit     *audit.Logger
+	logger    *slog.Logger
+}
+
+func (h *mcpHandlers) setToolPII(toolName string, f *safety.PIIFilter) {
+	if h.piiByTool == nil {
+		h.piiByTool = map[string]*safety.PIIFilter{}
+	}
+	h.piiByTool[toolName] = f
 }
 
 type handlerFunc func(ctx context.Context, args map[string]any) (any, error)
@@ -320,8 +355,12 @@ func (h *mcpHandlers) marshalAndRedact(toolName string, result any) (string, err
 		return "", fmt.Errorf("marshaling result: %w", err)
 	}
 	text := string(data)
-	if h.pii != nil {
-		redacted, count := h.pii.RedactWithCount(text)
+	pii := h.pii
+	if f, ok := h.piiByTool[toolName]; ok {
+		pii = f
+	}
+	if pii != nil {
+		redacted, count := pii.RedactWithCount(text)
 		if count > 0 {
 			h.logger.Info("pii redacted from MCP result", "tool", toolName, "patterns", count)
 			if h.audit != nil {
@@ -539,6 +578,71 @@ func registerTempoTools(s *server.MCPServer, src *tempo.Source, h *mcpHandlers) 
 	)
 
 	h.logger.Info("registered Tempo MCP tools", "count", 4)
+}
+
+func registerCloudflareTools(s *server.MCPServer, src *cloudflare.Source, h *mcpHandlers) {
+	handlers := src.Handlers()
+
+	if h.pii != nil {
+		h.setToolPII("query_cloudflare", h.pii.Without("ipv4"))
+	}
+
+	s.AddTool(
+		mcp.NewTool("query_cloudflare",
+			mcp.WithDescription("Query the Cloudflare GraphQL Analytics API for a configured zone. Datasets: httpRequestsAdaptive (sampled individual requests), httpRequestsAdaptiveGroups (aggregates), firewallEventsAdaptive (individual WAF/security events). Returns rows exactly as Cloudflare returns them plus the GraphQL query sent. Counts are sampled."),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("zone", mcp.Required(), mcp.Description("Configured zone name")),
+			mcp.WithString("dataset", mcp.Required(), mcp.Enum("httpRequestsAdaptive", "httpRequestsAdaptiveGroups", "firewallEventsAdaptive"), mcp.Description("Dataset to query")),
+			mcp.WithString("start", mcp.Description("Start time — relative like '1h ago' or RFC3339. Defaults to 1h ago")),
+			mcp.WithString("end", mcp.Description("End time — 'now' or RFC3339. Defaults to now")),
+			mcp.WithString("fields", mcp.Required(), mcp.Description("GraphQL selection set placed inside the dataset node, e.g. 'count avg { sampleInterval } dimensions { edgeResponseStatus clientRequestPath }'. Only letters, digits, underscores, whitespace and braces")),
+			mcp.WithObject("filter", mcp.Description("Optional filter as a JSON object, e.g. {\"clientRequestHTTPHost\":\"app.example.com\",\"edgeResponseStatus_geq\":500}. Nested objects and arrays of objects work for AND/OR. datetime_geq/datetime_leq are set from start/end")),
+			mcp.WithArray("order_by", mcp.WithStringItems(), mcp.Description("Ordering such as ['count_DESC']. Defaults to datetime_DESC, or count_DESC for httpRequestsAdaptiveGroups")),
+			mcp.WithNumber("limit", mcp.Description("Max rows (default 100, max 1000)")),
+		),
+		h.wrap(func(ctx context.Context, args map[string]any) (any, error) {
+			return handlers.QueryCloudflare(ctx, cloudflare.QueryCloudflareInput{
+				Zone:      stringArg(args, "zone"),
+				Dataset:   stringArg(args, "dataset"),
+				StartTime: stringArg(args, "start"),
+				EndTime:   stringArg(args, "end"),
+				Fields:    stringArg(args, "fields"),
+				Filter:    objectArg(args, "filter"),
+				OrderBy:   stringSliceArg(args, "order_by"),
+				Limit:     intArg(args, "limit"),
+			})
+		}),
+	)
+
+	h.logger.Info("registered Cloudflare MCP tools", "count", 1)
+}
+
+func objectArg(args map[string]any, key string) map[string]any {
+	switch v := args[key].(type) {
+	case map[string]any:
+		return v
+	case string:
+		var m map[string]any
+		if json.Unmarshal([]byte(v), &m) == nil {
+			return m
+		}
+	}
+	return nil
+}
+
+func stringSliceArg(args map[string]any, key string) []string {
+	var out []string
+	switch v := args[key].(type) {
+	case []any:
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+	case []string:
+		out = v
+	}
+	return out
 }
 
 func registerGrafanaTools(s *server.MCPServer, src *grafana.Source, h *mcpHandlers) {

@@ -29,6 +29,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/olusolaa/lokilens/internal/lokimcp/audit"
+	"github.com/olusolaa/lokilens/internal/lokimcp/cloudflare"
 	"github.com/olusolaa/lokilens/internal/lokimcp/config"
 	"github.com/olusolaa/lokilens/internal/lokimcp/grafana"
 	"github.com/olusolaa/lokilens/internal/lokimcp/loki"
@@ -90,6 +91,17 @@ func main() {
 		traceSource = tempo.NewSource(tempoClient, cfg.MaxTimeRange, auditLogger)
 	}
 
+	var cloudflareSource *cloudflare.Source
+	if cfg.CloudflareEnabled() {
+		cloudflareClient := cloudflare.NewHTTPClient(cloudflare.ClientConfig{
+			APIToken:   cfg.CloudflareAPIToken,
+			Timeout:    cfg.CloudflareTimeout,
+			MaxRetries: cfg.CloudflareMaxRetries,
+			Logger:     logger,
+		})
+		cloudflareSource = cloudflare.NewSource(cloudflareClient, cfg.CloudflareZones, cfg.CloudflareMaxTimeRange, auditLogger)
+	}
+
 	var grafanaSource *grafana.Source
 	if cfg.GrafanaEnabled() {
 		grafanaClient := grafana.NewHTTPClient(grafana.ClientConfig{
@@ -137,6 +149,14 @@ func main() {
 			logger.Info("trace backend connected", "backend", traceSource.Name())
 		}
 	}
+	if cloudflareSource != nil {
+		if err := cloudflareSource.HealthCheck(checkCtx); err != nil {
+			logger.Warn("cloudflare backend health check failed", "backend", cloudflareSource.Name(), "error", err)
+		} else {
+			healthy++
+			logger.Info("cloudflare backend connected", "backend", cloudflareSource.Name())
+		}
+	}
 	if grafanaSource != nil {
 		if err := grafanaSource.HealthCheck(checkCtx); err != nil {
 			logger.Warn("grafana backend health check failed", "backend", grafanaSource.Name(), "error", err)
@@ -152,7 +172,7 @@ func main() {
 
 	// Create and run the MCP server over stdio.
 	piiFilter := safety.NewPIIFilter()
-	mcpServer := mcppkg.NewServer(logSource, piiFilter, auditLogger, logger, mcppkg.WithMetrics(metricSource), mcppkg.WithTraces(traceSource), mcppkg.WithGrafana(grafanaSource))
+	mcpServer := mcppkg.NewServer(logSource, piiFilter, auditLogger, logger, mcppkg.WithMetrics(metricSource), mcppkg.WithTraces(traceSource), mcppkg.WithGrafana(grafanaSource), mcppkg.WithCloudflare(cloudflareSource))
 	stdio := server.NewStdioServer(mcpServer)
 	stdio.SetErrorLogger(log.New(os.Stderr, "mcp: ", log.LstdFlags))
 

@@ -238,3 +238,17 @@ func TestPIIFilter_CreditCard_15DigitTraceIDsPreserved(t *testing.T) {
 		}
 	}
 }
+
+func TestPIIFilter_WithoutKeepsOtherPatterns(t *testing.T) {
+	f := NewPIIFilter().Without("ipv4")
+	result := f.Redact("client 8.8.8.8 user john@example.com")
+	if !strings.Contains(result, "8.8.8.8") {
+		t.Errorf("expected public IP kept, got %q", result)
+	}
+	if strings.Contains(result, "john@example.com") {
+		t.Errorf("expected email redacted, got %q", result)
+	}
+	if !strings.Contains(NewPIIFilter().Redact("8.8.8.8"), "[REDACTED_IP]") {
+		t.Error("Without must not modify the original filter")
+	}
+}
